@@ -1245,9 +1245,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // Mirror of ggml_backend_meta_buffer_get_tensor: a MIRRORED tensor is replicated whole on every simple
+    // buffer and is written with a flat byte copy (the MIRRORED branch below forwards offset/size to each
+    // simple backend), so it need not be contiguous. Only the genuinely-split axes require contiguity.
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1360,9 +1364,16 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // A MIRRORED tensor is replicated whole on every simple buffer, so it can be read with a flat byte copy
+    // regardless of its strides: the MIRRORED branch below forwards offset/size straight to a simple backend,
+    // exactly like the CPU and CUDA get_tensor (which are flat memcpys and never check contiguity). Only the
+    // genuinely-split axes rely on the tensor being contiguous to splice it into per-GPU chunks. Relaxing the
+    // assert lets the scheduler stream a non-contiguous mirrored tensor - e.g. the MoE expert-id view
+    // ffn_moe_topk from ggml_argsort_top_k - down to a CPU-resident MUL_MAT_ID under -sm tensor + -ncmoe.
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);

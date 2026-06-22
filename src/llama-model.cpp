@@ -546,11 +546,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-            const int64_t n_embd      = hparams.n_embd;
-            const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
-            GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
-            GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-            return {{n_embd, 1}, {n_embd_gqa, 2}};
+            // use per-layer values: n_head_kv and the K/V head sizes can vary across layers
+            const int64_t n_embd_q     = (int64_t) hparams.n_head(il) * hparams.n_embd_head_k(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            GGML_ASSERT(tensor->ne[axis] == n_embd_q + n_embd_k_gqa + n_embd_v_gqa);
+            // K and V usually share the same head size and can be expressed as a single segment repeated
+            // twice, but some models (e.g. MiMo2) use a different head size for V, so split them separately
+            if (n_embd_k_gqa == n_embd_v_gqa) {
+                return {{n_embd_q, 1}, {n_embd_k_gqa, 2}};
+            }
+            return {{n_embd_q, 1}, {n_embd_k_gqa, 1}, {n_embd_v_gqa, 1}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             const int64_t n_ff_exp = hparams.n_ff_exp;
@@ -622,8 +628,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {granularity_kv};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-                GGML_ASSERT(segments.size() == 2);
-                return {granularity_q, granularity_kv};
+                if (segments.size() == 2) {
+                    return {granularity_q, granularity_kv};
+                }
+                // separate K and V segments (different head sizes): granularity_kv is a whole number of
+                // K heads, scale it to the V head size so K and V get the same number of heads per device
+                GGML_ASSERT(segments.size() == 3);
+                const int64_t granularity_v = granularity_kv / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il);
+                return {granularity_q, granularity_kv, granularity_v};
             }
         }
 
@@ -2695,16 +2707,19 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
         int flags) {
     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    // propagate caller flags (e.g. TENSOR_SKIP for unused NextN/MTP layers) to every tensor so that
+    // the weights and their matching biases are kept/dropped consistently - otherwise a "live" bias
+    // can be left without its sibling weight, which breaks tensor-parallel split state lookups
+    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
     if (layer.wqkv) {
-        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
-        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
-        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
-        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED | flags);
+        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED | flags);
+        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED | flags);
     }
 }
 

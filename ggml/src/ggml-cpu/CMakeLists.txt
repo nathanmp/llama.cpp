@@ -95,6 +95,28 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    # libnuma enables explicit per-node memory binding for the `--numa split` strategy.
+    if (NOT DEFINED GGML_NUMA)
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            set(GGML_NUMA ON)
+        else()
+            set(GGML_NUMA OFF)
+        endif()
+    endif()
+    if (GGML_NUMA)
+        find_library(NUMA_LIBRARY numa)
+        find_path(NUMA_INCLUDE_DIR numaif.h)
+        if (NUMA_LIBRARY AND NUMA_INCLUDE_DIR)
+            message(STATUS "Using libnuma for NUMA-aware weight splitting (${NUMA_LIBRARY})")
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LIBNUMA)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE ${NUMA_INCLUDE_DIR})
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NUMA_LIBRARY})
+        else()
+            message(WARNING "GGML_NUMA is ON but libnuma was not found (install libnuma-dev); "
+                            "the `--numa split` strategy will be a no-op")
+        endif()
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES

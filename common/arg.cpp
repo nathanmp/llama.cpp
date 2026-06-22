@@ -2409,12 +2409,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- split: split (do not mirror) CPU-resident weights across NUMA nodes so each node\n"
+        "         computes its own row-bands from node-local memory (needs libnuma; implies --no-mmap;\n"
+        "         do NOT also pin memory with numactl --membind)\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "split")   { params.numa = GGML_NUMA_STRATEGY_SPLIT; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));

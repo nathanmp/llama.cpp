@@ -617,24 +617,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_q};
+                // the attn_output input dim is n_head*head_v; when head_v differs from head_k scale the
+                // granularity so its head split matches Q (and hence the attention output) per device
+                return {granularity_q / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il)};
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            // when K and V use different head sizes (e.g. MiMo2) the V tensors must be split with a
+            // granularity scaled to the V head size, so that K and V keep the same number of heads per
+            // device. this also keeps Vcur (a slice of the fused QKV) and the V cache splits identical,
+            // which the KV-cache write (set_rows) requires.
+            const int64_t granularity_v = granularity_kv / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il);
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_kv};
+                const bool is_v = tensor_name.find("attn_v")  != std::string::npos ||
+                                  tensor_name.find("cache_v") != std::string::npos;
+                return {is_v ? granularity_v : granularity_kv};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 if (segments.size() == 2) {
                     return {granularity_q, granularity_kv};
                 }
-                // separate K and V segments (different head sizes): granularity_kv is a whole number of
-                // K heads, scale it to the V head size so K and V get the same number of heads per device
+                // separate K and V segments (different head sizes): K keeps granularity_kv, V uses the
+                // V-head-scaled granularity so both get the same number of heads per device
                 GGML_ASSERT(segments.size() == 3);
-                const int64_t granularity_v = granularity_kv / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il);
                 return {granularity_q, granularity_kv, granularity_v};
             }
         }

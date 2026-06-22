@@ -2168,6 +2168,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // NextN/MTP layers are loaded but not run during inference, so they must not get a
+                    // KV cache entry: otherwise (e.g. with tensor-parallel split) the cache tries to
+                    // reference attention tensors that were dropped via TENSOR_SKIP for those layers.
+                    if (filter == nullptr && hparams.n_layer_nextn > 0) {
+                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2707,12 +2714,15 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
         int flags) {
     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
-    // propagate caller flags (e.g. TENSOR_SKIP for unused NextN/MTP layers) to every tensor so that
-    // the weights and their matching biases are kept/dropped consistently - otherwise a "live" bias
-    // can be left without its sibling weight, which breaks tensor-parallel split state lookups
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
-    if (layer.wqkv) {
-        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
+    // detect a fused QKV tensor by its presence in the model file rather than by the create_tensor()
+    // return value: with TENSOR_SKIP (e.g. unused NextN/MTP layers) create_tensor() returns null even
+    // when the tensor exists, which would otherwise fall through to loading the (absent) split q/k/v.
+    // propagate the caller flags to every tensor so weights and their matching biases are kept/dropped
+    // together - a "live" bias left without its sibling weight breaks tensor-parallel split lookups.
+    const bool has_fused_qkv = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", bid).str().c_str()) != nullptr;
+    if (has_fused_qkv) {
+        layer.wqkv   = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
+        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);

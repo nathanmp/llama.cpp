@@ -38,6 +38,11 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // For GGML_NUMA_STRATEGY_SPLIT: bind a weight tensor's rows across NUMA nodes. Must be called
+    // BEFORE the tensor's memory is faulted (i.e. just before its data is read from disk) so the
+    // pages allocate node-locally with no migration. No-op for other strategies / non-NUMA / no libnuma.
+    GGML_BACKEND_API void    ggml_numa_split_bind_tensor(struct ggml_tensor * tensor);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

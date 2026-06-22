@@ -38,6 +38,13 @@
 #include <syscall.h>
 #endif
 
+#if defined(GGML_USE_LIBNUMA)
+#include <numa.h>
+#include <numaif.h>
+#include <unistd.h> // sysconf(_SC_PAGESIZE)
+#include <pthread.h>
+#endif
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -704,6 +711,17 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
                 GGML_LOG_WARN("/proc/sys/kernel/numa_balancing is enabled, this has been observed to impair performance\n");
             }
             fclose(fptr);
+        }
+
+        if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_SPLIT) {
+#if defined(GGML_USE_LIBNUMA)
+            GGML_LOG_INFO("numa: SPLIT strategy active across %u nodes; CPU-resident matmul weights "
+                          "will be bound per node (run WITHOUT numactl --membind)\n", g_state.numa.n_nodes);
+#else
+            GGML_LOG_WARN("numa: SPLIT strategy requested but this build has no libnuma "
+                          "(install libnuma-dev and rebuild with -DGGML_NUMA=ON); "
+                          "falling back to DISTRIBUTE-style first-touch placement only\n");
+#endif
         }
     }
 #else
@@ -2131,7 +2149,10 @@ static void set_numa_thread_affinity(int thread_n) {
 
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
+        case GGML_NUMA_STRATEGY_SPLIT:
             // run thread on node_num thread_n / (threads per node)
+            // SPLIT uses the same round-robin thread->node mapping as DISTRIBUTE; weight pages are
+            // bound to the matching node so each thread reads its row-band from node-local memory.
             node_num = thread_n % g_state.numa.n_nodes;
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
@@ -2191,6 +2212,132 @@ static void clear_numa_thread_affinity(void) {
 static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
+
+// ---- NUMA weight splitting (GGML_NUMA_STRATEGY_SPLIT) ----
+//
+// The CPU mul_mat / mul_mat_id paths, when ggml_is_numa() is true, force a static "one chunk per
+// thread" split by src0 (weight) rows: thread `ith` deterministically processes weight rows
+// [dr0*ith, dr0*(ith+1)) with dr0 = ceil(nrows/nth), and is pinned to node `ith % n_nodes`.
+// So each weight row is read by exactly one node. We exploit that by binding each thread's row-band
+// to its node's local memory, giving a true split (no duplication) that uses both sockets' bandwidth.
+#if defined(GGML_USE_LIBNUMA)
+
+// remember which weight tensors we've already placed so each is mbind()'d only once
+static pthread_mutex_t g_numa_split_mutex     = PTHREAD_MUTEX_INITIALIZER;
+static void **         g_numa_split_placed     = NULL;
+static size_t          g_numa_split_placed_n   = 0;
+static size_t          g_numa_split_placed_cap = 0;
+
+// returns true if `ptr` was newly recorded (i.e. the caller should place it)
+static bool ggml_numa_split_mark_placed(void * ptr) {
+    bool newly = false;
+    pthread_mutex_lock(&g_numa_split_mutex);
+    bool found = false;
+    for (size_t i = 0; i < g_numa_split_placed_n; ++i) {
+        if (g_numa_split_placed[i] == ptr) { found = true; break; }
+    }
+    if (!found) {
+        if (g_numa_split_placed_n == g_numa_split_placed_cap) {
+            size_t newcap = g_numa_split_placed_cap ? g_numa_split_placed_cap * 2 : 256;
+            void ** tmp = (void **) realloc(g_numa_split_placed, newcap * sizeof(void *));
+            if (tmp) { g_numa_split_placed = tmp; g_numa_split_placed_cap = newcap; }
+        }
+        if (g_numa_split_placed_n < g_numa_split_placed_cap) {
+            g_numa_split_placed[g_numa_split_placed_n++] = ptr;
+            newly = true;
+        }
+    }
+    pthread_mutex_unlock(&g_numa_split_mutex);
+    return newly;
+}
+
+// bind [addr, addr+len) (page-rounded) to a single NUMA node, migrating already-faulted pages
+static void ggml_numa_bind_range(void * addr, size_t len, int node) {
+    if (len == 0) {
+        return;
+    }
+    static long ps = 0;
+    if (ps == 0) {
+        ps = sysconf(_SC_PAGESIZE);
+    }
+    uintptr_t start = (uintptr_t) addr;
+    uintptr_t end   = start + len;
+    start &= ~((uintptr_t) ps - 1);                   // round down to page boundary
+    end    = (end + ps - 1) & ~((uintptr_t) ps - 1);  // round up to page boundary
+
+    unsigned long nodemask = 0;
+    nodemask |= 1UL << node;                           // n_nodes <= GGML_NUMA_MAX_NODES (8) < 64
+
+    long rv = mbind((void *) start, (size_t) (end - start), MPOL_BIND,
+                    &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
+    if (rv != 0) {
+        // not fatal: locality just won't be optimal for this range
+        GGML_LOG_DEBUG("numa split: mbind(node=%d, len=%zu) failed: %s\n",
+                       node, (size_t) (end - start), strerror(errno));
+    }
+}
+
+// split one matmul weight tensor's rows across nodes to match the static NUMA chunking
+static void ggml_numa_split_place_weight(const struct ggml_tensor * w, int n_threads) {
+    if (w == NULL || w->data == NULL || w->buffer == NULL) {
+        return;
+    }
+    if (!ggml_backend_buffer_is_host(w->buffer)) {
+        return; // weight lives on a GPU / non-host backend; nothing to bind
+    }
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (n_nodes < 2 || n_threads < 1) {
+        return;
+    }
+
+    const int64_t nrows = w->ne[1];   // rows of each 2D matrix (== mul_mat result rows)
+    const size_t  nb1   = w->nb[1];   // byte stride between rows
+    if (nrows < n_threads) {
+        return; // too small to split usefully; leave wherever it landed
+    }
+
+    const int64_t dr0 = (nrows + n_threads - 1) / n_threads; // rows per thread band
+
+    for (int64_t i3 = 0; i3 < w->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < w->ne[2]; ++i2) { // experts (mul_mat_id) / batch
+            char * mat = (char *) w->data + i2 * w->nb[2] + i3 * w->nb[3];
+            for (int ith = 0; ith < n_threads; ++ith) {
+                const int64_t r0 = dr0 * ith;
+                if (r0 >= nrows) {
+                    break;
+                }
+                const int64_t r1   = MIN(r0 + dr0, nrows);
+                const int     node = ith % n_nodes;   // must match set_numa_thread_affinity()
+                ggml_numa_bind_range(mat + r0 * nb1, (size_t) ((r1 - r0) * nb1), node);
+            }
+        }
+    }
+}
+
+// walk a graph once and place all CPU-resident matmul weights (src0 of MUL_MAT / MUL_MAT_ID)
+static void ggml_numa_split_place_graph(const struct ggml_cgraph * cgraph, int n_threads) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        struct ggml_tensor * w = node->src[0];
+        if (w == NULL || w->data == NULL) {
+            continue;
+        }
+        if (!ggml_numa_split_mark_placed(w->data)) {
+            continue; // already placed on a previous graph
+        }
+        ggml_numa_split_place_weight(w, n_threads);
+    }
+}
+
+#else
+static void ggml_numa_split_place_graph(const struct ggml_cgraph * cgraph, int n_threads) {
+    UNUSED(cgraph);
+    UNUSED(n_threads);
+}
+#endif // GGML_USE_LIBNUMA
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
@@ -3331,6 +3478,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+    }
+
+    // NUMA weight splitting: one-time, bind each CPU-resident matmul weight's row-bands to the node
+    // whose threads will read them. Done on the main thread before workers start (no race), and only
+    // once per weight tensor. mbind() may migrate already-faulted pages, so the first graph pays a
+    // one-time cost.
+    if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_SPLIT && ggml_is_numa()) {
+        ggml_numa_split_place_graph(cgraph, n_threads);
     }
 
 #ifdef GGML_USE_OPENMP

@@ -1524,12 +1524,15 @@ bool llama_model_loader::load_all_data(
     // its pages are faulted (read from disk), so they allocate node-locally with no later migration.
     // No-op unless the CPU backend was initialised with GGML_NUMA_STRATEGY_SPLIT (and built w/ libnuma).
     decltype(ggml_numa_split_bind_tensor) * numa_split_bind = nullptr;
+    decltype(ggml_numa_split_bind_report) * numa_split_report = nullptr;
     {
         auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev) {
             auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
             numa_split_bind = (decltype(ggml_numa_split_bind_tensor) *)
                 ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_numa_split_bind");
+            numa_split_report = (decltype(ggml_numa_split_bind_report) *)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_numa_split_report");
         }
     }
 
@@ -1657,6 +1660,10 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (numa_split_report) {
+        numa_split_report(); // log the SPLIT per-node binding summary (no-op unless --numa split)
     }
 
     // free temporary resources used for async uploads

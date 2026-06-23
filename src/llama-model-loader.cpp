@@ -1583,11 +1583,11 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                if (numa_split_bind) {
-                    numa_split_bind(cur); // bind rows to their NUMA node (migrates any faulted pages)
-                }
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (numa_split_bind) {
+                    numa_split_bind(cur); // place rows on their NUMA node (pages are now faulted)
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));

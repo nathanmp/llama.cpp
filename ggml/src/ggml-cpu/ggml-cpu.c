@@ -2247,8 +2247,16 @@ static void clear_numa_thread_affinity(void) {}
 // on large CPU-resident expert sets.) The split is independent of the runtime thread count.
 #if defined(GGML_USE_LIBNUMA)
 
-// set the memory policy of [addr, addr+len) (page-rounded) to bind to `node`. No MPOL_MF_MOVE:
-// intended to run BEFORE the pages are faulted, so they allocate on `node` with no migration.
+// diagnostics, accumulated across one model load and printed by ggml_numa_split_bind_report()
+static size_t g_numa_split_n_bound     = 0;
+static size_t g_numa_split_n_skip_small = 0;
+static size_t g_numa_split_n_skip_nc    = 0;
+static size_t g_numa_split_n_fail       = 0;
+static size_t g_numa_split_bytes[GGML_NUMA_MAX_NODES] = {0};
+
+// set the memory policy of [addr, addr+len) (page-rounded) to bind to `node`. Intended to run just
+// before the pages are faulted (so they allocate on `node` with no migration); MPOL_MF_MOVE is added
+// as a safety net in case some pages were already faulted (cheap when there is nothing to move).
 static void ggml_numa_bind_prefault(void * addr, size_t len, int node) {
     if (len == 0) {
         return;
@@ -2265,11 +2273,13 @@ static void ggml_numa_bind_prefault(void * addr, size_t len, int node) {
     unsigned long nodemask = 1UL << node;             // n_nodes <= GGML_NUMA_MAX_NODES (8) < 64
 
     long rv = mbind((void *) start, (size_t) (end - start), MPOL_BIND,
-                    &nodemask, sizeof(nodemask) * 8, 0 /* no MOVE: pages not yet faulted */);
+                    &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
     if (rv != 0) {
-        // not fatal: locality just won't be optimal for this range
+        g_numa_split_n_fail++;
         GGML_LOG_DEBUG("numa split: mbind(node=%d, len=%zu) failed: %s\n",
                        node, (size_t) (end - start), strerror(errno));
+    } else {
+        g_numa_split_bytes[node] += (size_t) (end - start);
     }
 }
 
@@ -2280,14 +2290,16 @@ void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
     if (t == NULL || t->data == NULL) {
         return;
     }
-    if (!ggml_is_contiguous(t)) {
-        return; // be conservative: row offsets below assume contiguous storage
-    }
     const int     n_nodes = (int) g_state.numa.n_nodes;
     const int64_t nrows   = t->ne[1];   // rows of each 2D matrix (== mul_mat result rows)
     const size_t  nb1     = t->nb[1];   // byte stride between rows
     if (n_nodes < 2 || nrows < n_nodes) {
+        g_numa_split_n_skip_small++;
         return; // too small to split usefully; leave wherever it lands (node 0)
+    }
+    if (!ggml_is_contiguous(t)) {
+        g_numa_split_n_skip_nc++;
+        return; // be conservative: row offsets below assume contiguous storage
     }
 
     // split rows into n_nodes contiguous chunks; node k owns [k*nrows/n_nodes, (k+1)*nrows/n_nodes).
@@ -2306,12 +2318,29 @@ void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
             }
         }
     }
+    g_numa_split_n_bound++;
+}
+
+void ggml_numa_split_bind_report(void) {
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_SPLIT || !ggml_is_numa()) {
+        return;
+    }
+    GGML_LOG_INFO("numa split: %u nodes detected; bound %zu weight tensors (skipped %zu small, %zu non-contiguous; %zu mbind failures)\n",
+                  g_state.numa.n_nodes, g_numa_split_n_bound, g_numa_split_n_skip_small, g_numa_split_n_skip_nc, g_numa_split_n_fail);
+    for (uint32_t k = 0; k < g_state.numa.n_nodes; ++k) {
+        GGML_LOG_INFO("numa split:   node %u: %.2f GiB requested on-node\n",
+                      k, g_numa_split_bytes[k] / (1024.0 * 1024.0 * 1024.0));
+    }
+    // reset for any subsequent load
+    g_numa_split_n_bound = g_numa_split_n_skip_small = g_numa_split_n_skip_nc = g_numa_split_n_fail = 0;
+    memset(g_numa_split_bytes, 0, sizeof(g_numa_split_bytes));
 }
 
 #else
 void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
     UNUSED(t);
 }
+void ggml_numa_split_bind_report(void) {}
 #endif // GGML_USE_LIBNUMA
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {

@@ -2395,15 +2395,18 @@ static void clear_numa_thread_affinity(void) {}
 // [dr0*ith, dr0*(ith+1)) with dr0 = ceil(nrows/nth). Under SPLIT we pin threads to nodes in
 // contiguous BLOCKS (threads [k*nth/n_nodes, (k+1)*nth/n_nodes) -> node k, see
 // set_numa_thread_affinity), so node k reads the contiguous row range
-// [k*nrows/n_nodes, (k+1)*nrows/n_nodes). We bind each weight's rows to the matching node so each
+// [k*nrows/n_nodes, (k+1)*nrows/n_nodes). We place each weight's rows on the matching node so each
 // node reads its band from node-local memory, giving a true split (no duplication) that uses both
-// sockets' bandwidth.
+// sockets' bandwidth. The split is independent of the runtime thread count.
 //
-// Placement uses mbind(MPOL_BIND | MPOL_MF_MOVE) per row-band. mbind splits the mapping exactly at the
-// band boundary (and splits transparent hugepages there), so each node gets precisely its half. (A
-// move_pages() variant was tried for speed but, on kernels that migrate whole 2 MB THPs, it dragged
-// the boundary hugepage's node-0 data onto node 1 and unbalanced the split.) The split is independent
-// of the runtime thread count.
+// Two placement mechanisms, chosen automatically by whether transparent hugepages (THP) are enabled:
+//  * THP on  -> mbind(MPOL_BIND | MPOL_MF_MOVE) per row-band. mbind splits the mapping/THP exactly at
+//               the band boundary, so each node gets precisely its half. Correct but slow on big MoE
+//               models (~tens of thousands of VMA-splitting syscalls).
+//  * THP off -> batched move_pages() of the node!=0 4 KiB pages. Thousands of pages per syscall, no
+//               VMA splits -> fast. Requires 4 KiB pages (move_pages migrates whole 2 MB THPs, which
+//               would drag boundary node-0 data across the socket) and numa_balancing=0 (move_pages
+//               sets no policy, so default-policy pages must not auto-migrate).
 #if defined(GGML_USE_LIBNUMA)
 
 // diagnostics, accumulated across one model load and printed by ggml_numa_split_bind_report()
@@ -2412,20 +2415,35 @@ static size_t g_numa_split_n_skip_small = 0;
 static size_t g_numa_split_n_skip_nc    = 0;
 static size_t g_numa_split_n_fail       = 0;
 static size_t g_numa_split_bytes[GGML_NUMA_MAX_NODES] = {0};
+static long   g_numa_ps                 = 0;
 
-// bind [addr, addr+len) (page-rounded) to `node` with MPOL_BIND, migrating any already-faulted pages.
+// true unless transparent hugepages are disabled system-wide (.../transparent_hugepage/enabled shows
+// "[never]"). Cached after the first read.
+static bool ggml_numa_thp_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 1; // assume enabled if the knob can't be read
+        FILE * f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+        if (f) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), f) && strstr(buf, "[never]")) {
+                cached = 0;
+            }
+            fclose(f);
+        }
+    }
+    return cached != 0;
+}
+
+// THP-on path: bind [addr, addr+len) (page-rounded) to `node` with MPOL_BIND, migrating faulted pages.
 static void ggml_numa_bind_range(void * addr, size_t len, int node) {
     if (len == 0) {
         return;
     }
-    static long ps = 0;
-    if (ps == 0) {
-        ps = sysconf(_SC_PAGESIZE);
-    }
     uintptr_t start = (uintptr_t) addr;
     uintptr_t end   = start + len;
-    start &= ~((uintptr_t) ps - 1);                   // round down to page boundary
-    end    = (end + ps - 1) & ~((uintptr_t) ps - 1);  // round up to page boundary
+    start &= ~((uintptr_t) g_numa_ps - 1);                   // round down to page boundary
+    end    = (end + g_numa_ps - 1) & ~((uintptr_t) g_numa_ps - 1); // round up to page boundary
 
     unsigned long nodemask = 1UL << node;             // n_nodes <= GGML_NUMA_MAX_NODES (8) < 64
 
@@ -2437,6 +2455,47 @@ static void ggml_numa_bind_range(void * addr, size_t len, int node) {
                        node, (size_t) (end - start), strerror(errno));
     } else {
         g_numa_split_bytes[node] += (size_t) (end - start);
+    }
+}
+
+// THP-off path: batched move_pages() state (the loader calls these single-threaded)
+#define GGML_NUMA_MOVE_BATCH (1u << 18) // 256K pages ~= 1 GiB per move_pages() call
+static void ** g_numa_mv_pages  = NULL;
+static int  *  g_numa_mv_nodes  = NULL;
+static int  *  g_numa_mv_status = NULL;
+static size_t  g_numa_mv_count  = 0;
+
+static void ggml_numa_move_flush(void) {
+    if (g_numa_mv_count == 0) {
+        return;
+    }
+    long rv = move_pages(0, g_numa_mv_count, g_numa_mv_pages, g_numa_mv_nodes, g_numa_mv_status, MPOL_MF_MOVE);
+    if (rv < 0) {
+        g_numa_split_n_fail += g_numa_mv_count;
+        GGML_LOG_DEBUG("numa split: move_pages(%zu) failed: %s\n", g_numa_mv_count, strerror(errno));
+    } else {
+        for (size_t i = 0; i < g_numa_mv_count; ++i) {
+            if (g_numa_mv_status[i] < 0) {
+                g_numa_split_n_fail++;
+            }
+        }
+    }
+    g_numa_mv_count = 0;
+}
+
+static void ggml_numa_move_add(void * page, int node) {
+    if (g_numa_mv_pages == NULL) {
+        g_numa_mv_pages  = (void **) malloc(GGML_NUMA_MOVE_BATCH * sizeof(void *));
+        g_numa_mv_nodes  = (int *)   malloc(GGML_NUMA_MOVE_BATCH * sizeof(int));
+        g_numa_mv_status = (int *)   malloc(GGML_NUMA_MOVE_BATCH * sizeof(int));
+        if (!g_numa_mv_pages || !g_numa_mv_nodes || !g_numa_mv_status) {
+            return; // out of memory: migration becomes a no-op
+        }
+    }
+    g_numa_mv_pages[g_numa_mv_count] = page;
+    g_numa_mv_nodes[g_numa_mv_count] = node;
+    if (++g_numa_mv_count == GGML_NUMA_MOVE_BATCH) {
+        ggml_numa_move_flush();
     }
 }
 
@@ -2458,19 +2517,37 @@ void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
         g_numa_split_n_skip_nc++;
         return; // be conservative: row offsets below assume contiguous storage
     }
+    if (g_numa_ps == 0) {
+        g_numa_ps = sysconf(_SC_PAGESIZE);
+    }
+    const bool thp = ggml_numa_thp_enabled();
 
-    // node k owns rows [k*nrows/n_nodes, (k+1)*nrows/n_nodes). Bind every chunk (including node 0)
-    // explicitly so each node's pages are placed precisely. ne[2]/ne[3] iterate experts / batch.
+    // node k owns rows [k*nrows/n_nodes, (k+1)*nrows/n_nodes). ne[2]/ne[3] iterate experts / batch.
     for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
         for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
-            char * mat = (char *) t->data + i2 * t->nb[2] + i3 * t->nb[3];
+            const uintptr_t mat = (uintptr_t) t->data + i2 * t->nb[2] + i3 * t->nb[3];
             for (int k = 0; k < n_nodes; ++k) {
                 const int64_t r0 = nrows * k       / n_nodes;
                 const int64_t r1 = nrows * (k + 1) / n_nodes;
                 if (r1 <= r0) {
                     continue;
                 }
-                ggml_numa_bind_range(mat + r0 * nb1, (size_t) ((r1 - r0) * nb1), k);
+                if (thp) {
+                    // bind every chunk (incl. node 0) so mbind places it precisely and exempts it
+                    // from any auto-balancing
+                    ggml_numa_bind_range((void *) (mat + r0 * nb1), (size_t) ((r1 - r0) * nb1), k);
+                } else {
+                    g_numa_split_bytes[k] += (size_t) ((r1 - r0) * nb1);
+                    if (k == 0) {
+                        continue; // home node: pages already here (loader/alloc on node 0)
+                    }
+                    // migrate the 4 KiB pages fully contained in this band
+                    uintptr_t p = ((mat + r0 * nb1) + g_numa_ps - 1) & ~((uintptr_t) g_numa_ps - 1);
+                    uintptr_t e =  (mat + r1 * nb1)                  & ~((uintptr_t) g_numa_ps - 1);
+                    for (; p < e; p += (uintptr_t) g_numa_ps) {
+                        ggml_numa_move_add((void *) p, k);
+                    }
+                }
             }
         }
     }
@@ -2481,10 +2558,12 @@ void ggml_numa_split_bind_report(void) {
     if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_SPLIT || !ggml_is_numa()) {
         return;
     }
-    GGML_LOG_INFO("numa split: %u nodes; bound %zu weight tensors (skipped %zu small, %zu non-contiguous; %zu mbind failures)\n",
-                  g_state.numa.n_nodes, g_numa_split_n_bound, g_numa_split_n_skip_small, g_numa_split_n_skip_nc, g_numa_split_n_fail);
+    ggml_numa_move_flush(); // flush any pages still batched (THP-off path)
+    GGML_LOG_INFO("numa split: %u nodes, %s; bound %zu weight tensors (skipped %zu small, %zu non-contiguous; %zu failures)\n",
+                  g_state.numa.n_nodes, ggml_numa_thp_enabled() ? "mbind (THP on)" : "move_pages (THP off, fast)",
+                  g_numa_split_n_bound, g_numa_split_n_skip_small, g_numa_split_n_skip_nc, g_numa_split_n_fail);
     for (uint32_t k = 0; k < g_state.numa.n_nodes; ++k) {
-        GGML_LOG_INFO("numa split:   node %u: %.2f GiB requested on-node\n",
+        GGML_LOG_INFO("numa split:   node %u: %.2f GiB on-node\n",
                       k, g_numa_split_bytes[k] / (1024.0 * 1024.0 * 1024.0));
     }
     // reset for any subsequent load

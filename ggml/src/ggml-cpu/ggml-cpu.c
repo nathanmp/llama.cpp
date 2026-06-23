@@ -2305,6 +2305,11 @@ void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
     // split rows into n_nodes contiguous chunks; node k owns [k*nrows/n_nodes, (k+1)*nrows/n_nodes).
     // This matches the BLOCK thread->node mapping in set_numa_thread_affinity and does not depend on
     // the runtime thread count. ne[2]/ne[3] iterate experts (mul_mat_id) / batch.
+    //
+    // node 0 is skipped: weights are faulted on node 0 first (pinned host buffers at allocation, plain
+    // CPU buffers by the loader thread which runs on node 0), so node-0 rows are already home and need
+    // no syscall. Only nodes 1..n-1 are migrated. This roughly halves the number of mbind() calls (and
+    // the VMA splits they create) for the common 2-node case.
     for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
         for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
             char * mat = (char *) t->data + i2 * t->nb[2] + i3 * t->nb[3];
@@ -2312,6 +2317,10 @@ void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
                 const int64_t r0 = nrows * k       / n_nodes;
                 const int64_t r1 = nrows * (k + 1) / n_nodes;
                 if (r1 <= r0) {
+                    continue;
+                }
+                if (k == 0) {
+                    g_numa_split_bytes[0] += (size_t) ((r1 - r0) * nb1); // already on node 0
                     continue;
                 }
                 ggml_numa_bind_prefault(mat + r0 * nb1, (size_t) ((r1 - r0) * nb1), k);

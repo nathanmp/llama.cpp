@@ -570,169 +570,10 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
-// ---- optional NUMA-hierarchical barrier (experimental; enable with GGML_NUMA_HBARRIER=1) ----
-//
-// The default ggml_barrier() has every thread hammer one global counter/flag, so across two sockets
-// that cache line ping-pongs over the inter-socket link O(n_threads) times per barrier. For batch=1
-// token generation (tiny per-op work, many ops) that cross-socket traffic dominates and is why
-// pinning to a single socket beats --numa split on TG.
-//
-// This two-level barrier instead has threads sync on a NODE-LOCAL counter first (on-die), then a
-// single "leader" per node crosses the socket. Cross-socket traffic drops to O(n_nodes) per barrier.
-// It is toggled at runtime so the flat vs hierarchical barrier can be A/B-benchmarked with one binary,
-// and it works for both the OpenMP and native threadpools (it is pure atomics keyed off the thread's
-// node). Only active under GGML_NUMA_STRATEGY_SPLIT with libnuma (node-local counter placement).
-
-#if defined(_MSC_VER)
-#define GGML_NUMA_TLS __declspec(thread)
-#else
-#define GGML_NUMA_TLS _Thread_local
-#endif
-
-static GGML_NUMA_TLS int tl_numa_node = -1; // NUMA node of the current compute thread (-1 = unknown)
-
-static atomic_int * g_numa_bar_count [GGML_NUMA_MAX_NODES] = {0}; // node-local arrival counters
-static atomic_int * g_numa_bar_passed[GGML_NUMA_MAX_NODES] = {0}; // node-local release senses
-static int          g_numa_node_nthreads[GGML_NUMA_MAX_NODES] = {0};
-static int          g_numa_hbar_n_nodes = 0; // <=1 => disabled (use the flat barrier)
-static atomic_int GGML_CACHE_ALIGN g_numa_leader_count  = 0; // leader-level (cross-socket) counters
-static atomic_int GGML_CACHE_ALIGN g_numa_leader_passed = 0;
-
-// thread -> node mapping; MUST stay in sync with set_numa_thread_affinity()
-static int ggml_numa_thread_node(int ith, int nth) {
-    const int n_nodes = (int) g_state.numa.n_nodes;
-    if (n_nodes < 1) {
-        return 0;
-    }
-    switch (g_state.numa.numa_strategy) {
-        case GGML_NUMA_STRATEGY_SPLIT: {
-            const int tpn = (nth + n_nodes - 1) / n_nodes; // threads per node (block mapping)
-            const int nd  = tpn > 0 ? ith / tpn : 0;
-            return nd < n_nodes ? nd : n_nodes - 1;
-        }
-        case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            return ith % n_nodes;
-        default:
-            return 0;
-    }
-}
-
-#if defined(GGML_USE_LIBNUMA)
-static bool ggml_numa_hbar_alloc_node(int nd, atomic_int ** out_count, atomic_int ** out_passed) {
-    const long ps = sysconf(_SC_PAGESIZE);
-    void * p = NULL;
-    if (posix_memalign(&p, (size_t) ps, (size_t) ps) != 0 || p == NULL) {
-        return false;
-    }
-    unsigned long mask = 1UL << nd;
-    mbind(p, (size_t) ps, MPOL_BIND, &mask, sizeof(mask) * 8, 0); // place on node nd at first touch
-    memset(p, 0, (size_t) ps);                                    // fault -> lands on node nd
-    *out_count  = (atomic_int *) p;
-    *out_passed = (atomic_int *) ((char *) p + GGML_CACHE_LINE);  // separate cache line
-    return true;
-}
-#endif
-
-// (re)initialise hierarchical-barrier state for a graph run with `nth` threads. Must be called on the
-// main thread before workers start, with the SAME nth the workers will use.
-static void ggml_numa_hbar_init(int nth) {
-    g_numa_hbar_n_nodes = 0;
-#if defined(GGML_USE_LIBNUMA)
-    static int allocated_for_nodes = -1;
-    if (!ggml_is_numa() || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_SPLIT) {
-        return;
-    }
-    const char * env = getenv("GGML_NUMA_HBARRIER");
-    if (env == NULL || env[0] == '0' || env[0] == '\0') {
-        return;
-    }
-    const int n_nodes = (int) g_state.numa.n_nodes;
-    if (n_nodes < 2 || nth < 1) {
-        return;
-    }
-    for (int k = 0; k < n_nodes; ++k) {
-        g_numa_node_nthreads[k] = 0;
-    }
-    for (int ith = 0; ith < nth; ++ith) {
-        g_numa_node_nthreads[ggml_numa_thread_node(ith, nth)]++;
-    }
-    for (int k = 0; k < n_nodes; ++k) {
-        if (g_numa_node_nthreads[k] < 1) {
-            return; // a node with no threads would hang the leader barrier; stay on the flat barrier
-        }
-    }
-    if (allocated_for_nodes != n_nodes) {
-        for (int k = 0; k < n_nodes; ++k) {
-            if (!ggml_numa_hbar_alloc_node(k, &g_numa_bar_count[k], &g_numa_bar_passed[k])) {
-                return; // leave disabled on allocation failure
-            }
-        }
-        allocated_for_nodes = n_nodes;
-    }
-    for (int k = 0; k < n_nodes; ++k) {
-        atomic_store_explicit(g_numa_bar_count[k],  0, memory_order_relaxed);
-        atomic_store_explicit(g_numa_bar_passed[k], 0, memory_order_relaxed);
-    }
-    atomic_store_explicit(&g_numa_leader_count,  0, memory_order_relaxed);
-    atomic_store_explicit(&g_numa_leader_passed, 0, memory_order_relaxed);
-    g_numa_hbar_n_nodes = n_nodes;
-
-    static bool logged = false;
-    if (!logged) {
-        GGML_LOG_INFO("numa split: hierarchical barrier ENABLED across %d nodes (threads/node:", n_nodes);
-        for (int k = 0; k < n_nodes; ++k) {
-            GGML_LOG_INFO(" %d", g_numa_node_nthreads[k]);
-        }
-        GGML_LOG_INFO(")\n");
-        logged = true;
-    }
-#else
-    GGML_UNUSED(nth);
-#endif
-}
-
-static void ggml_numa_hbarrier(int nd) {
-    atomic_int * lcount  = g_numa_bar_count[nd];
-    atomic_int * lpassed = g_numa_bar_passed[nd];
-
-    const int local_prev = atomic_load_explicit(lpassed, memory_order_relaxed);
-    const int arrived    = atomic_fetch_add_explicit(lcount, 1, memory_order_seq_cst) + 1;
-
-    if (arrived == g_numa_node_nthreads[nd]) {
-        // node leader: reset local counter, then cross the socket with the other leaders
-        atomic_store_explicit(lcount, 0, memory_order_relaxed);
-
-        const int g_prev = atomic_load_explicit(&g_numa_leader_passed, memory_order_relaxed);
-        const int g_arr  = atomic_fetch_add_explicit(&g_numa_leader_count, 1, memory_order_seq_cst) + 1;
-        if (g_arr == g_numa_hbar_n_nodes) {
-            atomic_store_explicit(&g_numa_leader_count, 0, memory_order_relaxed);
-            atomic_fetch_add_explicit(&g_numa_leader_passed, 1, memory_order_seq_cst);
-        } else {
-            while (atomic_load_explicit(&g_numa_leader_passed, memory_order_relaxed) == g_prev) {
-                ggml_thread_cpu_relax();
-            }
-        }
-        atomic_fetch_add_explicit(lpassed, 1, memory_order_seq_cst); // release node followers
-    } else {
-        while (atomic_load_explicit(lpassed, memory_order_relaxed) == local_prev) {
-            ggml_thread_cpu_relax();
-        }
-    }
-    atomic_thread_fence(memory_order_seq_cst);
-}
-
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
-    }
-
-    if (g_numa_hbar_n_nodes > 1) {
-        const int nd = tl_numa_node;
-        if (nd >= 0 && nd < g_numa_hbar_n_nodes) {
-            ggml_numa_hbarrier(nd);
-            return;
-        }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3415,13 +3256,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     set_numa_thread_affinity(state->ith);
 #endif
 
-    // record this thread's NUMA node for the hierarchical barrier (if enabled). Uses the same nth
-    // (tp->n_graph) the barrier sees, so per-node thread counts match exactly (a mismatch would hang).
-    if (g_numa_hbar_n_nodes > 1) {
-        const int nth = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
-        tl_numa_node = ggml_numa_thread_node(state->ith, nth);
-    }
-
     struct ggml_compute_params params = {
         /*.ith        =*/ state->ith,
         /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
@@ -3729,9 +3563,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // publish the thread count so SPLIT thread affinity can map threads to nodes in contiguous blocks
     // (weight pages were already bound per node at load time, see ggml_numa_split_bind_tensor).
-    // hierarchical-barrier state is (re)initialised per path below with the final thread count.
     atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
-    g_numa_hbar_n_nodes = 0;
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -3743,7 +3575,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
                 atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
-                ggml_numa_hbar_init(n_threads); // use the actual OpenMP thread count
             }
 
             // Apply thread CPU mask and priority
@@ -3766,7 +3597,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 
     atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
-    ggml_numa_hbar_init(n_threads);
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);

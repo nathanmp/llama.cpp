@@ -1,0 +1,120 @@
+
+AMDuProfPcm Report
+
+Processor Name:,AMD EPYC 7532 32-Core Processor                
+System:,Family(0x17) Model(0x31) Stepping(0x0)
+Operating System:,Linux 6.14.0-37-generic
+Number of Sockets :,2
+Number of CCDs :,16
+Number of Core Complexes(CCX) :,32
+Number of Cores :,64
+Number of Threads :,64
+SMT Enabled in HW:,False
+SMT Enabled by OS :,False
+
+CPU Topology:
+Socket, CCD, CCX, Core(s)
+0,0,0, 0 1
+0,0,1, 2 3
+0,1,2, 4 5
+0,1,3, 6 7
+0,2,4, 8 9
+0,2,5, 10 11
+0,3,6, 12 13
+0,3,7, 14 15
+0,4,8, 16 17
+0,4,9, 18 19
+0,5,10, 20 21
+0,5,11, 22 23
+0,6,12, 24 25
+0,6,13, 26 27
+0,7,14, 28 29
+0,7,15, 30 31
+1,8,16, 32 33
+1,8,17, 34 35
+1,9,18, 36 37
+1,9,19, 38 39
+1,10,20, 40 41
+1,10,21, 42 43
+1,11,22, 44 45
+1,11,23, 46 47
+1,12,24, 48 49
+1,12,25, 50 51
+1,13,26, 52 53
+1,13,27, 54 55
+1,14,28, 56 57
+1,14,29, 58 59
+1,15,30, 60 61
+1,15,31, 62 63
+
+Core P0 state frequency (MHz):,2400.000000
+Multiplex interval (ms):,100
+Sample interval (ms):,1200
+Data Collection Driver:,MSR Driver
+NMI Watchdog Enabled:,0
+Version:,5.3.521.0 (PUBLIC)
+
+Hypervisor Info:
+Hypervisor Enabled:,False
+Command:,"AMDuProfPcm -m memory -a -d 60 -o /home/nathan/code/llama.cpp/bw.csv --msr"
+
+Abbreviation :
+IPC    : Instructions Per CPU Cycle
+CPI    : CPU Cycles Per Instructions
+pti    : Per Thousand Instructions
+ptc    : Per Thousand CPU Cycles
+pto    : Per Thousand Operations
+
+Profile Time: 2026/06/25 00:57:50:257
+DF METRICS,,,
+System (Aggregated),,,
+Total Mem Bw (GB/s),Total Mem RdBw (GB/s),Total Mem WrBw (GB/s),
+67.13,66.90,0.22,
+67.48,67.27,0.20,
+66.98,66.79,0.20,
+67.85,67.51,0.34,
+67.46,67.06,0.40,
+67.53,67.09,0.44,
+67.89,67.11,0.78,
+60.12,58.35,1.78,
+68.56,67.80,0.77,
+69.39,68.33,1.06,
+67.64,67.18,0.45,
+68.07,67.63,0.44,
+67.28,66.97,0.31,
+67.30,67.01,0.29,
+67.14,66.81,0.33,
+68.14,67.72,0.42,
+67.50,67.12,0.38,
+65.87,65.49,0.38,
+66.77,66.40,0.36,
+65.97,65.65,0.31,
+66.80,66.43,0.38,
+67.78,67.42,0.36,
+67.08,66.72,0.35,
+68.36,67.51,0.86,
+67.08,66.72,0.36,
+67.74,67.39,0.35,
+66.72,66.39,0.33,
+66.81,66.49,0.32,
+66.77,66.46,0.31,
+67.29,66.99,0.30,
+66.77,66.42,0.35,
+66.75,66.45,0.30,
+67.12,66.77,0.35,
+55.86,55.35,0.50,
+66.74,66.37,0.37,
+66.88,66.50,0.38,
+68.02,67.19,0.83,
+68.11,67.41,0.71,
+66.87,66.36,0.50,
+68.41,67.71,0.70,
+68.48,67.64,0.84,
+68.03,67.31,0.72,
+65.02,64.70,0.32,
+66.48,66.12,0.36,
+66.33,66.08,0.25,
+66.60,66.28,0.32,
+66.25,65.92,0.33,
+66.62,66.29,0.33,
+66.03,65.65,0.38,

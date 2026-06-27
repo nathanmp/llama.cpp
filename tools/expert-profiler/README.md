@@ -10,17 +10,26 @@ counts the expert ids passed to each layer's `ffn_down_exps` `mul_mat_id`, givin
 one tally per routing decision per layer. No graph changes are needed, so it
 works for any MoE architecture that goes through `build_moe_ffn`.
 
+Both phases are profiled: each prompt is prefilled and then tokens are generated
+autoregressively, so decode routing (which dominates for reasoning models) is
+counted, not just prefill. The summary reports the prefill / decode token and
+decision split so you can confirm generation was actually exercised.
+
 ## Usage
 
 ```sh
-llama-expert-profiler -m model.gguf -f prompt.txt [-c 4096] [-o expert-usage.csv]
+llama-expert-profiler -m model.gguf -f prompts.txt [-c 4096] [-n 256] [-o expert-usage.csv]
 ```
 
-- `-p` / `-f` supply the prompt (longer / more representative is better).
-- `-c` sets the context window; prompts longer than it are processed in
-  independent windows.
+- `-f` is a prompt file with **one prompt per line**. A literal `\n` inside a
+  line is turned into a newline (so multi-line prompts go on a single line as
+  `part one\npart two`). `-p` supplies a single prompt instead.
+- `-n` is the number of tokens to generate per prompt (default 256); generation
+  stops early on EOS.
+- `-c` sets the context window; prompts longer than it are truncated.
 - `-o` is the CSV dump path (default `expert-usage.csv`).
-- Standard `-ngl`, `-t`, `--numa`, etc. from the common args also apply.
+- Counts are aggregated across all prompts. Sampling/`-ngl`/`-t`/`--numa` and the
+  other common args also apply.
 
 ## Output
 

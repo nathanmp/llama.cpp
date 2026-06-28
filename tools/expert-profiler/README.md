@@ -43,3 +43,35 @@ Printed to stderr:
 
 The CSV holds the full `layer,expert,count,frac_of_layer` table for offline
 plotting or driving a placement plan.
+
+## Placement planning (Phase 1)
+
+Two companions turn the profile into a go/no-go on expert-aware placement, using only
+mechanisms that exist today (whole-tensor `-ot` / `--n-cpu-moe`, `--numa split`).
+
+`expert_placement.py` reads the CSV and contrasts the GPU activation coverage you can get
+today (whole-tensor offload, which can only place whole layers) against the per-expert
+ceiling, at each VRAM budget:
+
+```sh
+python3 tools/expert-profiler/expert_placement.py --csv expert-usage.csv --vram-budget 0.70
+```
+
+It prints the coverage table, a recommended `--n-cpu-moe N` baseline, and the gap to the
+per-expert ceiling. A small gap means a per-expert rewrite has little headroom for this
+profile; a large gap means it could move real work off the CPU.
+
+Note: every MoE layer routes the same number of tokens, so whole-tensor offload coverage is
+essentially the GPU layer fraction - it cannot exploit per-expert skew. (The last layer reads
+slightly lower because of output-id graph pruning during prefill.)
+
+`bench_placement.sh` then measures decode throughput under the achievable-today placements
+(row vs layer split to isolate allreduce cost; `--n-cpu-moe`; `--numa split`) so you can
+compare the best real number against that ceiling:
+
+```sh
+MODEL=/path/model.gguf TS="1/1/1/1/1/0.5/0.5" NCMOE=5 bash tools/expert-profiler/bench_placement.sh
+```
+
+Profile with a large, representative run (10-50k generated tokens) before trusting the
+numbers - a short sample understates how many experts are really used.

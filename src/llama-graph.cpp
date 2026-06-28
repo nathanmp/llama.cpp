@@ -1681,6 +1681,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     __func__, moe_split_frac, (long long) n_split, (long long) n_expert);
         }
 
+        const int64_t n_cold = n_expert - n_split;
+
         // route each (token, slot) to exactly one group by clamping the expert id into range;
         // out-of-range slots become don't-cares that the masks below zero out.
         // note: ggml_clamp is in-place (a view of its input), so each clamp gets its own cast
@@ -1688,8 +1690,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * ids_f  = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
         ggml_tensor * idsA_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), 0.0f, (float) (n_split - 1));
         ggml_tensor * idsB_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), (float) n_split, (float) (n_expert - 1));
-        ggml_tensor * idsA   = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
-        ggml_tensor * idsB   = ggml_cast(ctx0, idsB_f, GGML_TYPE_I32);
+
+        // group A indexes the hot sub-tensor (experts [0, n_split)) directly; group B indexes the
+        // cold sub-tensor (experts [n_split, n_expert)) so its ids are shifted to local 0-based space
+        ggml_tensor * idsA      = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
+        ggml_tensor * shift     = ggml_arange(ctx0, -(float) n_split, -(float) n_split + 0.5f, 1.0f); // {-n_split}
+        ggml_tensor * idsB_loc  = ggml_cast(ctx0, ggml_add(ctx0, idsB_f, shift), GGML_TYPE_I32);
 
         // maskA = 1 for group-A slots (id < n_split), else 0; maskB is the complement
         ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, ids_f), 0.0f, 1.0f);
@@ -1697,17 +1703,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         maskA = ggml_reshape_3d(ctx0, maskA, 1, n_expert_used, n_tokens);
         maskB = ggml_reshape_3d(ctx0, maskB, 1, n_expert_used, n_tokens);
 
-        auto expert_ffn = [&](ggml_tensor * ids) {
-            ggml_tensor * u = build_lora_mm_id(up_exps,   cur, ids, nullptr);
-            ggml_tensor * g = build_lora_mm_id(gate_exps, cur, ids, nullptr);
+        // sub-tensor over a contiguous expert range; stand-in for the two physical tensors that
+        // load-time placement will put on different devices (hot -> GPU, cold -> CPU)
+        auto expert_slice = [&](ggml_tensor * t, int64_t e0, int64_t ne) {
+            return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], ne, t->nb[1], t->nb[2], (size_t) e0 * t->nb[2]);
+        };
+        auto expert_ffn = [&](ggml_tensor * ids, int64_t e0, int64_t ne) {
+            ggml_tensor * u = build_lora_mm_id(expert_slice(up_exps,   e0, ne), cur, ids, nullptr);
+            ggml_tensor * g = build_lora_mm_id(expert_slice(gate_exps, e0, ne), cur, ids, nullptr);
             ggml_tensor * a = ggml_swiglu_split(ctx0, g, u);
-            return build_lora_mm_id(down_exps, a, ids, nullptr); // [n_embd, n_expert_used, n_tokens]
+            return build_lora_mm_id(expert_slice(down_exps, e0, ne), a, ids, nullptr); // [n_embd, n_expert_used, n_tokens]
         };
 
         ggml_tensor * experts =
             ggml_add(ctx0,
-                ggml_mul(ctx0, expert_ffn(idsA), ggml_mul(ctx0, weights, maskA)),
-                ggml_mul(ctx0, expert_ffn(idsB), ggml_mul(ctx0, weights, maskB)));
+                ggml_mul(ctx0, expert_ffn(idsA,     0,       n_split), ggml_mul(ctx0, weights, maskA)),
+                ggml_mul(ctx0, expert_ffn(idsB_loc, n_split, n_cold),  ggml_mul(ctx0, weights, maskB)));
         cb(experts, "ffn_moe_split_weighted", il);
 
         ggml_build_forward_expand(gf, experts);

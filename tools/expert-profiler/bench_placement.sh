@@ -41,24 +41,24 @@ echo "model: $MODEL" | tee -a "$OUT"
 echo "pp=$PP tg=$TG reps=$REPS ngl=$NGL ncmoe=$NCMOE ts=${TS:-none}" | tee -a "$OUT"
 echo | tee -a "$OUT"
 
-# 1. baseline: row split across GPUs (the allreduce-heavy path you have today)
-run "baseline (row split)"            -sm row   $(ts_arg)
+# 1. baseline: tensor split across GPUs (your best path; supersedes row split)
+run "baseline (tensor split)"         -sm tensor $(ts_arg)
 
-# 2. layer/pipeline split: no per-layer allreduce - isolates the OcuLink allreduce cost
-run "layer split (no allreduce)"      -sm layer $(ts_arg)
+# 2. layer split, for comparison (you measured tensor > layer, but worth confirming on this rig)
+run "layer split"                     -sm layer  $(ts_arg)
 
 # 3. cold experts on CPU (whole-layer placement; approximates the idea at today's granularity)
-run "n-cpu-moe=$NCMOE (row)"          -sm row   $(ts_arg) -ncmoe "$NCMOE"
-run "n-cpu-moe=$NCMOE (layer)"        -sm layer $(ts_arg) -ncmoe "$NCMOE"
+run "n-cpu-moe=$NCMOE (tensor)"       -sm tensor $(ts_arg) -ncmoe "$NCMOE"
 
 # 4. add NUMA-local binding for the CPU-resident experts (needs a libnuma build; disables mmap)
-run "n-cpu-moe=$NCMOE + numa split"   -sm layer $(ts_arg) -ncmoe "$NCMOE" --numa split
+run "n-cpu-moe=$NCMOE + numa split"   -sm tensor $(ts_arg) -ncmoe "$NCMOE" --numa split
 
 echo "done. results in $OUT"
 echo
 echo "Read the 'tg' (token generation) column. Compare:"
-echo "  baseline row vs layer split      -> how much allreduce over OcuLink is costing you"
-echo "  layer vs +n-cpu-moe              -> cost of spilling cold experts to CPU"
-echo "  +n-cpu-moe vs +numa split        -> value of NUMA-local cold experts"
-echo "If the best of these is already near the per-expert ceiling from expert_placement.py,"
-echo "the Phase-2 rewrite has little headroom. If a big gap remains, Phase 2 is justified."
+echo "  baseline vs n-cpu-moe            -> cost of spilling cold experts to CPU at your budget"
+echo "  n-cpu-moe vs +numa split         -> value of NUMA-local cold experts"
+echo "The n-cpu-moe tg is the whole-layer baseline. expert_placement.py shows the per-expert"
+echo "ceiling at the same budget; the gap between them is the most Phase 2 could recover."
+echo "If most of the model already fits in VRAM (small -ncmoe), that gap is small and Phase 2"
+echo "buys little - re-check this once all your GPUs are connected."

@@ -1520,6 +1520,22 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // For `--numa split`: hook to bind each CPU-resident weight's rows across NUMA nodes just before
+    // its pages are faulted (read from disk), so they allocate node-locally with no later migration.
+    // No-op unless the CPU backend was initialised with GGML_NUMA_STRATEGY_SPLIT (and built w/ libnuma).
+    decltype(ggml_numa_split_bind_tensor) * numa_split_bind = nullptr;
+    decltype(ggml_numa_split_bind_report) * numa_split_report = nullptr;
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+            numa_split_bind = (decltype(ggml_numa_split_bind_tensor) *)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_numa_split_bind");
+            numa_split_report = (decltype(ggml_numa_split_bind_report) *)
+                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_numa_split_report");
+        }
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1569,6 +1585,9 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (numa_split_bind) {
+                    numa_split_bind(cur); // place rows on their NUMA node (pages are now faulted)
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1641,6 +1660,10 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (numa_split_report) {
+        numa_split_report(); // log the SPLIT per-node binding summary (no-op unless --numa split)
     }
 
     // free temporary resources used for async uploads

@@ -38,6 +38,13 @@
 #include <syscall.h>
 #endif
 
+#if defined(GGML_USE_LIBNUMA)
+#include <numa.h>
+#include <numaif.h>
+#include <unistd.h> // sysconf(_SC_PAGESIZE)
+#include <pthread.h>
+#endif
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -704,6 +711,17 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
                 GGML_LOG_WARN("/proc/sys/kernel/numa_balancing is enabled, this has been observed to impair performance\n");
             }
             fclose(fptr);
+        }
+
+        if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_SPLIT) {
+#if defined(GGML_USE_LIBNUMA)
+            GGML_LOG_INFO("numa: SPLIT strategy active across %u nodes; CPU-resident matmul weights "
+                          "will be bound per node (run WITHOUT numactl --membind)\n", g_state.numa.n_nodes);
+#else
+            GGML_LOG_WARN("numa: SPLIT strategy requested but this build has no libnuma "
+                          "(install libnuma-dev and rebuild with -DGGML_NUMA=ON); "
+                          "falling back to DISTRIBUTE-style first-touch placement only\n");
+#endif
         }
     }
 #else
@@ -2118,6 +2136,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 }
 
+// number of compute threads in the active graph; published by ggml_graph_compute so that the SPLIT
+// strategy can map threads to nodes in contiguous blocks (see set_numa_thread_affinity).
+static atomic_int g_numa_n_threads = 0;
+
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
 static void set_numa_thread_affinity(int thread_n) {
@@ -2134,6 +2156,21 @@ static void set_numa_thread_affinity(int thread_n) {
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
             break;
+        case GGML_NUMA_STRATEGY_SPLIT: {
+            // BLOCK mapping: contiguous groups of threads share a node, so node k runs threads
+            // [k*tpn, (k+1)*tpn) which read the contiguous weight row range owned by node k.
+            // Weight pages are bound to the matching node at load time (ggml_numa_split_bind_tensor).
+            int nth = atomic_load_explicit(&g_numa_n_threads, memory_order_relaxed);
+            if (nth < 1) {
+                nth = (int) g_state.numa.n_nodes;
+            }
+            const int tpn = (nth + (int) g_state.numa.n_nodes - 1) / (int) g_state.numa.n_nodes;
+            node_num = tpn > 0 ? thread_n / tpn : 0;
+            if (node_num >= (int) g_state.numa.n_nodes) {
+                node_num = (int) g_state.numa.n_nodes - 1;
+            }
+            break;
+        }
         case GGML_NUMA_STRATEGY_ISOLATE:
             // run thread on current_node
             node_num = g_state.numa.current_node;
@@ -2191,6 +2228,197 @@ static void clear_numa_thread_affinity(void) {
 static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
+
+// ---- NUMA weight splitting (GGML_NUMA_STRATEGY_SPLIT) ----
+//
+// The CPU mul_mat / mul_mat_id paths, when ggml_is_numa() is true, force a static "one chunk per
+// thread" split by src0 (weight) rows: thread `ith` deterministically processes weight rows
+// [dr0*ith, dr0*(ith+1)) with dr0 = ceil(nrows/nth). Under SPLIT we pin threads to nodes in
+// contiguous BLOCKS (threads [k*nth/n_nodes, (k+1)*nth/n_nodes) -> node k, see
+// set_numa_thread_affinity), so node k reads the contiguous row range
+// [k*nrows/n_nodes, (k+1)*nrows/n_nodes). We place each weight's rows on the matching node so each
+// node reads its band from node-local memory, giving a true split (no duplication) that uses both
+// sockets' bandwidth. The split is independent of the runtime thread count.
+//
+// Two placement mechanisms, chosen automatically by whether transparent hugepages (THP) are enabled:
+//  * THP on  -> mbind(MPOL_BIND | MPOL_MF_MOVE) per row-band. mbind splits the mapping/THP exactly at
+//               the band boundary, so each node gets precisely its half. Correct but slow on big MoE
+//               models (~tens of thousands of VMA-splitting syscalls).
+//  * THP off -> batched move_pages() of the node!=0 4 KiB pages. Thousands of pages per syscall, no
+//               VMA splits -> fast. Requires 4 KiB pages (move_pages migrates whole 2 MB THPs, which
+//               would drag boundary node-0 data across the socket) and numa_balancing=0 (move_pages
+//               sets no policy, so default-policy pages must not auto-migrate).
+#if defined(GGML_USE_LIBNUMA)
+
+// diagnostics, accumulated across one model load and printed by ggml_numa_split_bind_report()
+static size_t g_numa_split_n_bound      = 0;
+static size_t g_numa_split_n_skip_small = 0;
+static size_t g_numa_split_n_skip_nc    = 0;
+static size_t g_numa_split_n_fail       = 0;
+static size_t g_numa_split_bytes[GGML_NUMA_MAX_NODES] = {0};
+static long   g_numa_ps                 = 0;
+
+// true unless transparent hugepages are disabled system-wide (.../transparent_hugepage/enabled shows
+// "[never]"). Cached after the first read.
+static bool ggml_numa_thp_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 1; // assume enabled if the knob can't be read
+        FILE * f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+        if (f) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), f) && strstr(buf, "[never]")) {
+                cached = 0;
+            }
+            fclose(f);
+        }
+    }
+    return cached != 0;
+}
+
+// THP-on path: bind [addr, addr+len) (page-rounded) to `node` with MPOL_BIND, migrating faulted pages.
+static void ggml_numa_bind_range(void * addr, size_t len, int node) {
+    if (len == 0) {
+        return;
+    }
+    uintptr_t start = (uintptr_t) addr;
+    uintptr_t end   = start + len;
+    start &= ~((uintptr_t) g_numa_ps - 1);                   // round down to page boundary
+    end    = (end + g_numa_ps - 1) & ~((uintptr_t) g_numa_ps - 1); // round up to page boundary
+
+    unsigned long nodemask = 1UL << node;             // n_nodes <= GGML_NUMA_MAX_NODES (8) < 64
+
+    long rv = mbind((void *) start, (size_t) (end - start), MPOL_BIND,
+                    &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
+    if (rv != 0) {
+        g_numa_split_n_fail++;
+        GGML_LOG_DEBUG("numa split: mbind(node=%d, len=%zu) failed: %s\n",
+                       node, (size_t) (end - start), strerror(errno));
+    } else {
+        g_numa_split_bytes[node] += (size_t) (end - start);
+    }
+}
+
+// THP-off path: batched move_pages() state (the loader calls these single-threaded)
+#define GGML_NUMA_MOVE_BATCH (1u << 18) // 256K pages ~= 1 GiB per move_pages() call
+static void ** g_numa_mv_pages  = NULL;
+static int  *  g_numa_mv_nodes  = NULL;
+static int  *  g_numa_mv_status = NULL;
+static size_t  g_numa_mv_count  = 0;
+
+static void ggml_numa_move_flush(void) {
+    if (g_numa_mv_count == 0) {
+        return;
+    }
+    long rv = move_pages(0, g_numa_mv_count, g_numa_mv_pages, g_numa_mv_nodes, g_numa_mv_status, MPOL_MF_MOVE);
+    if (rv < 0) {
+        g_numa_split_n_fail += g_numa_mv_count;
+        GGML_LOG_DEBUG("numa split: move_pages(%zu) failed: %s\n", g_numa_mv_count, strerror(errno));
+    } else {
+        for (size_t i = 0; i < g_numa_mv_count; ++i) {
+            if (g_numa_mv_status[i] < 0) {
+                g_numa_split_n_fail++;
+            }
+        }
+    }
+    g_numa_mv_count = 0;
+}
+
+static void ggml_numa_move_add(void * page, int node) {
+    if (g_numa_mv_pages == NULL) {
+        g_numa_mv_pages  = (void **) malloc(GGML_NUMA_MOVE_BATCH * sizeof(void *));
+        g_numa_mv_nodes  = (int *)   malloc(GGML_NUMA_MOVE_BATCH * sizeof(int));
+        g_numa_mv_status = (int *)   malloc(GGML_NUMA_MOVE_BATCH * sizeof(int));
+        if (!g_numa_mv_pages || !g_numa_mv_nodes || !g_numa_mv_status) {
+            return; // out of memory: migration becomes a no-op
+        }
+    }
+    g_numa_mv_pages[g_numa_mv_count] = page;
+    g_numa_mv_nodes[g_numa_mv_count] = node;
+    if (++g_numa_mv_count == GGML_NUMA_MOVE_BATCH) {
+        ggml_numa_move_flush();
+    }
+}
+
+void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_SPLIT || !ggml_is_numa()) {
+        return;
+    }
+    if (t == NULL || t->data == NULL) {
+        return;
+    }
+    const int     n_nodes = (int) g_state.numa.n_nodes;
+    const int64_t nrows   = t->ne[1];   // rows of each 2D matrix (== mul_mat result rows)
+    const size_t  nb1     = t->nb[1];   // byte stride between rows
+    if (n_nodes < 2 || nrows < n_nodes) {
+        g_numa_split_n_skip_small++;
+        return; // too small to split usefully; leave wherever it lands (node 0)
+    }
+    if (!ggml_is_contiguous(t)) {
+        g_numa_split_n_skip_nc++;
+        return; // be conservative: row offsets below assume contiguous storage
+    }
+    if (g_numa_ps == 0) {
+        g_numa_ps = sysconf(_SC_PAGESIZE);
+    }
+    const bool thp = ggml_numa_thp_enabled();
+
+    // node k owns rows [k*nrows/n_nodes, (k+1)*nrows/n_nodes). ne[2]/ne[3] iterate experts / batch.
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+            const uintptr_t mat = (uintptr_t) t->data + i2 * t->nb[2] + i3 * t->nb[3];
+            for (int k = 0; k < n_nodes; ++k) {
+                const int64_t r0 = nrows * k       / n_nodes;
+                const int64_t r1 = nrows * (k + 1) / n_nodes;
+                if (r1 <= r0) {
+                    continue;
+                }
+                if (thp) {
+                    // bind every chunk (incl. node 0) so mbind places it precisely and exempts it
+                    // from any auto-balancing
+                    ggml_numa_bind_range((void *) (mat + r0 * nb1), (size_t) ((r1 - r0) * nb1), k);
+                } else {
+                    g_numa_split_bytes[k] += (size_t) ((r1 - r0) * nb1);
+                    if (k == 0) {
+                        continue; // home node: pages already here (loader/alloc on node 0)
+                    }
+                    // migrate the 4 KiB pages fully contained in this band
+                    uintptr_t p = ((mat + r0 * nb1) + g_numa_ps - 1) & ~((uintptr_t) g_numa_ps - 1);
+                    uintptr_t e =  (mat + r1 * nb1)                  & ~((uintptr_t) g_numa_ps - 1);
+                    for (; p < e; p += (uintptr_t) g_numa_ps) {
+                        ggml_numa_move_add((void *) p, k);
+                    }
+                }
+            }
+        }
+    }
+    g_numa_split_n_bound++;
+}
+
+void ggml_numa_split_bind_report(void) {
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_SPLIT || !ggml_is_numa()) {
+        return;
+    }
+    ggml_numa_move_flush(); // flush any pages still batched (THP-off path)
+    GGML_LOG_INFO("numa split: %u nodes, %s; bound %zu weight tensors (skipped %zu small, %zu non-contiguous; %zu failures)\n",
+                  g_state.numa.n_nodes, ggml_numa_thp_enabled() ? "mbind (THP on)" : "move_pages (THP off, fast)",
+                  g_numa_split_n_bound, g_numa_split_n_skip_small, g_numa_split_n_skip_nc, g_numa_split_n_fail);
+    for (uint32_t k = 0; k < g_state.numa.n_nodes; ++k) {
+        GGML_LOG_INFO("numa split:   node %u: %.2f GiB on-node\n",
+                      k, g_numa_split_bytes[k] / (1024.0 * 1024.0 * 1024.0));
+    }
+    // reset for any subsequent load
+    g_numa_split_n_bound = g_numa_split_n_skip_small = g_numa_split_n_skip_nc = g_numa_split_n_fail = 0;
+    memset(g_numa_split_bytes, 0, sizeof(g_numa_split_bytes));
+}
+
+#else
+void ggml_numa_split_bind_tensor(struct ggml_tensor * t) {
+    UNUSED(t);
+}
+void ggml_numa_split_bind_report(void) {}
+#endif // GGML_USE_LIBNUMA
+
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
@@ -3333,6 +3561,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    // publish the thread count so SPLIT thread affinity can map threads to nodes in contiguous blocks
+    // (weight pages were already bound per node at load time, see ggml_numa_split_bind_tensor).
+    atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3342,6 +3574,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+                atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
             }
 
             // Apply thread CPU mask and priority
@@ -3362,6 +3595,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
         n_threads = threadpool->n_threads;
     }
+
+    atomic_store_explicit(&g_numa_n_threads, n_threads, memory_order_relaxed);
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);

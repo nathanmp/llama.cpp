@@ -1539,6 +1539,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
+    // NUMA weight splitting needs private, bindable pages whose first fault we control, so it uses
+    // the non-mmap read path (the loader binds each weight's rows to a node just before reading it).
+    if (params.numa == GGML_NUMA_STRATEGY_SPLIT && mparams.use_mmap) {
+        LOG_INF("%s: --numa split: disabling mmap so CPU-resident weights can be bound per NUMA node "
+                "(tip: add --direct-io for fast loading without buffered I/O)\n", __func__);
+        mparams.use_mmap = false;
+    }
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;

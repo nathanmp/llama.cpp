@@ -546,11 +546,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-            const int64_t n_embd      = hparams.n_embd;
-            const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
-            GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
-            GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-            return {{n_embd, 1}, {n_embd_gqa, 2}};
+            // use per-layer values: n_head_kv and the K/V head sizes can vary across layers
+            const int64_t n_embd_q     = (int64_t) hparams.n_head(il) * hparams.n_embd_head_k(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            GGML_ASSERT(tensor->ne[axis] == n_embd_q + n_embd_k_gqa + n_embd_v_gqa);
+            // K and V usually share the same head size and can be expressed as a single segment repeated
+            // twice, but some models (e.g. MiMo2) use a different head size for V, so split them separately
+            if (n_embd_k_gqa == n_embd_v_gqa) {
+                return {{n_embd_q, 1}, {n_embd_k_gqa, 2}};
+            }
+            return {{n_embd_q, 1}, {n_embd_k_gqa, 1}, {n_embd_v_gqa, 1}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             const int64_t n_ff_exp = hparams.n_ff_exp;
@@ -611,19 +617,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_q};
+                // the attn_output input dim is n_head*head_v; when head_v differs from head_k scale the
+                // granularity so its head split matches Q (and hence the attention output) per device
+                return {granularity_q / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il)};
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            // when K and V use different head sizes (e.g. MiMo2) the V tensors must be split with a
+            // granularity scaled to the V head size, so that K and V keep the same number of heads per
+            // device. this also keeps Vcur (a slice of the fused QKV) and the V cache splits identical,
+            // which the KV-cache write (set_rows) requires.
+            const int64_t granularity_v = granularity_kv / hparams.n_embd_head_k(il) * hparams.n_embd_head_v(il);
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_kv};
+                const bool is_v = tensor_name.find("attn_v")  != std::string::npos ||
+                                  tensor_name.find("cache_v") != std::string::npos;
+                return {is_v ? granularity_v : granularity_kv};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-                GGML_ASSERT(segments.size() == 2);
-                return {granularity_q, granularity_kv};
+                if (segments.size() == 2) {
+                    return {granularity_q, granularity_kv};
+                }
+                // separate K and V segments (different head sizes): K keeps granularity_kv, V uses the
+                // V-head-scaled granularity so both get the same number of heads per device
+                GGML_ASSERT(segments.size() == 3);
+                return {granularity_q, granularity_kv, granularity_v};
             }
         }
 
@@ -2156,6 +2176,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // NextN/MTP layers are loaded but not run during inference, so they must not get a
+                    // KV cache entry: otherwise (e.g. with tensor-parallel split) the cache tries to
+                    // reference attention tensors that were dropped via TENSOR_SKIP for those layers.
+                    if (filter == nullptr && hparams.n_layer_nextn > 0) {
+                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2695,16 +2722,22 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
         int flags) {
     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-    if (layer.wqkv) {
-        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    // detect a fused QKV tensor by its presence in the model file rather than by the create_tensor()
+    // return value: with TENSOR_SKIP (e.g. unused NextN/MTP layers) create_tensor() returns null even
+    // when the tensor exists, which would otherwise fall through to loading the (absent) split q/k/v.
+    // propagate the caller flags to every tensor so weights and their matching biases are kept/dropped
+    // together - a "live" bias left without its sibling weight breaks tensor-parallel split lookups.
+    const bool has_fused_qkv = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", bid).str().c_str()) != nullptr;
+    if (has_fused_qkv) {
+        layer.wqkv   = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
+        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL | flags);
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
-        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
-        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
-        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED | flags);
+        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED | flags);
+        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED | flags);
     }
 }
 

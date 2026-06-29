@@ -31,11 +31,21 @@ extern "C" {
         GGML_NUMA_STRATEGY_ISOLATE    = 2,
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
+        GGML_NUMA_STRATEGY_SPLIT      = 5, // split (not mirror) CPU-resident weights across NUMA nodes
         GGML_NUMA_STRATEGY_COUNT
     };
 
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+
+    // For GGML_NUMA_STRATEGY_SPLIT: bind a weight tensor's rows across NUMA nodes. Must be called
+    // BEFORE the tensor's memory is faulted (i.e. just before its data is read from disk) so the
+    // pages allocate node-locally with no migration. No-op for other strategies / non-NUMA / no libnuma.
+    GGML_BACKEND_API void    ggml_numa_split_bind_tensor(struct ggml_tensor * tensor);
+
+    // Logs a summary of the last SPLIT binding pass (tensors bound, bytes per node, failures). No-op
+    // for other strategies / non-NUMA / no libnuma. Call once after model weights are loaded.
+    GGML_BACKEND_API void    ggml_numa_split_bind_report(void);
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

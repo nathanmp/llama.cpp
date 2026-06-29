@@ -144,7 +144,11 @@ llama_model_olmoe::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_FFN_SILU, false,
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                il);
+                il,
+                nullptr, nullptr, nullptr, nullptr, nullptr,
+                model.layers[il].ffn_up_exps_hot,
+                model.layers[il].ffn_gate_exps_hot,
+                model.layers[il].ffn_down_exps_hot);
         cb(cur, "ffn_moe_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

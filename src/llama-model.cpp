@@ -1640,6 +1640,75 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // PROTOTYPE: load-time MoE expert placement. LLAMA_MOE_SPLIT=<frac in (0,1)> copies each
+    // simple-MoE layer's first n_split experts into a separate "hot" tensor on the layer's device
+    // buffer (GPU when the layer is offloaded), so the graph can run hot experts there while the
+    // full tensor (cold experts) stays where it was placed (e.g. CPU via --cpu-moe). Splitting is
+    // by file order for now; a hotness-aware reordering pass is the follow-up that turns this
+    // mechanism into an actual coverage win.
+    if (const char * s = getenv("LLAMA_MOE_SPLIT")) {
+        const float frac = atof(s);
+        if (frac > 0.0f && frac < 1.0f) {
+            size_t n_hot_layers = 0;
+            for (int il = 0; il < (int) layers.size(); ++il) {
+                auto & layer = layers[il];
+
+                const bool simple_moe =
+                    layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps &&
+                    !layer.ffn_gate_up_exps &&
+                    !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b && !layer.ffn_down_exps_b &&
+                    !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s;
+                if (!simple_moe) {
+                    continue;
+                }
+
+                const int64_t n_expert = layer.ffn_up_exps->ne[2];
+                const int64_t n_split  = std::min<int64_t>(std::max<int64_t>(1, (int64_t) (frac * n_expert + 0.5f)), n_expert - 1);
+
+                ggml_backend_dev_t dev = pimpl->dev_layer.at(il).dev;
+                ggml_backend_buffer_type_t hot_buft = ggml_backend_dev_buffer_type(dev);
+
+                ggml_init_params ip = { ggml_tensor_overhead()*3, nullptr, /*no_alloc*/ true };
+                ggml_context * ctx = ggml_init(ip);
+
+                ggml_tensor * full[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+                ggml_tensor * hot[3];
+                const char * hot_names[3] = { "ffn_up_exps_hot", "ffn_gate_exps_hot", "ffn_down_exps_hot" };
+                for (int k = 0; k < 3; ++k) {
+                    hot[k] = ggml_new_tensor_3d(ctx, full[k]->type, full[k]->ne[0], full[k]->ne[1], n_split);
+                    ggml_set_name(hot[k], (std::string("blk.") + std::to_string(il) + "." + hot_names[k]).c_str());
+                }
+
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, hot_buft);
+                if (!buf) {
+                    ggml_free(ctx);
+                    LLAMA_LOG_WARN("%s: failed to allocate hot expert buffer for layer %d\n", __func__, il);
+                    continue;
+                }
+
+                // copy the first n_split experts (a contiguous prefix of the fused tensor)
+                std::vector<char> tmp;
+                for (int k = 0; k < 3; ++k) {
+                    const size_t nbytes = ggml_nbytes(hot[k]);
+                    tmp.resize(nbytes);
+                    ggml_backend_tensor_get(full[k], tmp.data(), 0, nbytes);
+                    ggml_backend_tensor_set(hot[k], tmp.data(), 0, nbytes);
+                }
+
+                layer.ffn_up_exps_hot   = hot[0];
+                layer.ffn_gate_exps_hot = hot[1];
+                layer.ffn_down_exps_hot = hot[2];
+
+                std::vector<ggml_backend_buffer_ptr> bufv;
+                bufv.emplace_back(buf);
+                pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx), std::move(bufv));
+                n_hot_layers++;
+            }
+            LLAMA_LOG_INFO("%s: MoE expert placement: hot expert tensors created for %zu layers (frac=%.3f)\n",
+                    __func__, n_hot_layers, frac);
+        }
+    }
+
     return true;
 }
 

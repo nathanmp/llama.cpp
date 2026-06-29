@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1641,15 +1643,69 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // PROTOTYPE: load-time MoE expert placement. LLAMA_MOE_SPLIT=<frac in (0,1)> copies each
-    // simple-MoE layer's first n_split experts into a separate "hot" tensor on the layer's device
+    // simple-MoE layer's hottest n_split experts into a separate "hot" tensor on the layer's device
     // buffer (GPU when the layer is offloaded), so the graph can run hot experts there while the
-    // full tensor (cold experts) stays where it was placed (e.g. CPU via --cpu-moe). Splitting is
-    // by file order for now; a hotness-aware reordering pass is the follow-up that turns this
-    // mechanism into an actual coverage win.
+    // full tensor (cold experts) stays where it was placed (e.g. CPU via --cpu-moe).
+    // LLAMA_MOE_PROFILE=<expert-usage.csv from llama-expert-profiler> reorders each layer's experts
+    // by descending usage first, so the hot prefix [0, n_split) holds the hottest experts (the real
+    // coverage win). Without a profile the split is by file order. Reordering only relabels experts
+    // (router columns and expert weights are permuted together), so model output is unchanged.
     if (const char * s = getenv("LLAMA_MOE_SPLIT")) {
         const float frac = atof(s);
         if (frac > 0.0f && frac < 1.0f) {
+            // optional per-layer expert usage profile -> hotness-ordered permutation. Reordering
+            // rewrites model tensors in place, which is only valid for owned (writable) buffers;
+            // mmap'd weights are read-only, so it requires --no-mmap.
+            std::map<int, std::vector<int64_t>> profile;
+            if (const char * pf = getenv("LLAMA_MOE_PROFILE")) {
+                if (ml.use_mmap) {
+                    LLAMA_LOG_WARN("%s: LLAMA_MOE_PROFILE needs --no-mmap to reorder experts; splitting by file order\n",
+                            __func__);
+                } else {
+                    std::ifstream f(pf);
+                    if (f) {
+                        std::string line;
+                        std::getline(f, line); // header: layer,expert,count,frac_of_layer
+                        int il_csv, ex_csv;
+                        long long cnt_csv;
+                        while (std::getline(f, line)) {
+                            if (sscanf(line.c_str(), "%d,%d,%lld", &il_csv, &ex_csv, &cnt_csv) == 3) {
+                                auto & v = profile[il_csv];
+                                if ((int) v.size() <= ex_csv) {
+                                    v.resize(ex_csv + 1, 0);
+                                }
+                                v[ex_csv] = cnt_csv;
+                            }
+                        }
+                        LLAMA_LOG_INFO("%s: MoE expert placement: loaded usage profile for %zu layers from '%s'\n",
+                                __func__, profile.size(), pf);
+                    } else {
+                        LLAMA_LOG_WARN("%s: failed to open LLAMA_MOE_PROFILE '%s'; splitting by file order\n",
+                                __func__, pf);
+                    }
+                }
+            }
+
+            // reorder a tensor's expert dimension in place: new slot i takes old slot perm[i]. The
+            // expert axis is the highest non-trivial dim of each tensor (expert weights -> dim 2,
+            // router columns -> dim 1, router bias -> dim 0), so its slices are contiguous blocks.
+            auto permute_experts = [](ggml_tensor * t, int dim, const std::vector<int> & perm) {
+                const size_t slice = t->nb[dim];
+                const size_t total = ggml_nbytes(t);
+                if (total != perm.size() * slice) {
+                    return false;
+                }
+                std::vector<char> src(total), dst(total);
+                ggml_backend_tensor_get(t, src.data(), 0, total);
+                for (size_t i = 0; i < perm.size(); ++i) {
+                    memcpy(dst.data() + i*slice, src.data() + (size_t) perm[i]*slice, slice);
+                }
+                ggml_backend_tensor_set(t, dst.data(), 0, total);
+                return true;
+            };
+
             size_t n_hot_layers = 0;
+            size_t n_perm_layers = 0;
             for (int il = 0; il < (int) layers.size(); ++il) {
                 auto & layer = layers[il];
 
@@ -1664,6 +1720,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
                 const int64_t n_expert = layer.ffn_up_exps->ne[2];
                 const int64_t n_split  = std::min<int64_t>(std::max<int64_t>(1, (int64_t) (frac * n_expert + 0.5f)), n_expert - 1);
+
+                // hotness reorder: sort experts by descending usage so the hottest land in [0, n_split).
+                // every per-expert tensor (weights + router columns/bias) is permuted by the same map,
+                // so this is a pure relabeling that leaves the model's output unchanged.
+                auto pit = profile.find(il);
+                if (pit != profile.end() && (int64_t) pit->second.size() == n_expert) {
+                    const auto & cnt = pit->second;
+                    std::vector<int> perm(n_expert);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::stable_sort(perm.begin(), perm.end(),
+                            [&](int a, int b) { return cnt[a] > cnt[b]; });
+
+                    bool identity = true;
+                    for (int64_t i = 0; i < n_expert; ++i) {
+                        if (perm[i] != (int) i) { identity = false; break; }
+                    }
+                    if (!identity) {
+                        bool ok =
+                            permute_experts(layer.ffn_up_exps,   2, perm) &&
+                            permute_experts(layer.ffn_gate_exps, 2, perm) &&
+                            permute_experts(layer.ffn_down_exps, 2, perm) &&
+                            permute_experts(layer.ffn_gate_inp,  1, perm);
+                        if (ok && layer.ffn_gate_inp_b)  { ok = permute_experts(layer.ffn_gate_inp_b,  0, perm); }
+                        if (ok && layer.ffn_exp_probs_b) { ok = permute_experts(layer.ffn_exp_probs_b, 0, perm); }
+                        if (ok) {
+                            n_perm_layers++;
+                        } else {
+                            LLAMA_LOG_WARN("%s: expert reorder skipped for layer %d (unexpected tensor layout)\n",
+                                    __func__, il);
+                        }
+                    }
+                }
 
                 ggml_backend_dev_t dev = pimpl->dev_layer.at(il).dev;
                 ggml_backend_buffer_type_t hot_buft = ggml_backend_dev_buffer_type(dev);
@@ -1704,8 +1792,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx), std::move(bufv));
                 n_hot_layers++;
             }
-            LLAMA_LOG_INFO("%s: MoE expert placement: hot expert tensors created for %zu layers (frac=%.3f)\n",
-                    __func__, n_hot_layers, frac);
+            LLAMA_LOG_INFO("%s: MoE expert placement: hot expert tensors created for %zu layers (frac=%.3f), reordered %zu layers by usage\n",
+                    __func__, n_hot_layers, frac, n_perm_layers);
         }
     }
 

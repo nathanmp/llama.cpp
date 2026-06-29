@@ -75,3 +75,23 @@ MODEL=/path/model.gguf TS="1/1/1/1/1/0.5/0.5" NCMOE=5 bash tools/expert-profiler
 
 Profile with a large, representative run (10-50k generated tokens) before trusting the
 numbers - a short sample understates how many experts are really used.
+
+## Expert-aware device split (Phase 2)
+
+The CSV also drives the load-time device split (`src/llama-model.cpp`), which puts the
+hottest experts on a faster buffer (GPU) and serves the cold ones from the full tensor
+(e.g. CPU via `--cpu-moe`):
+
+```sh
+LLAMA_MOE_SPLIT=0.25 LLAMA_MOE_PROFILE=expert-usage.csv \
+    llama-cli -m model.gguf -ngl 99 --cpu-moe --no-mmap -p "..." -n 64
+```
+
+- `LLAMA_MOE_SPLIT=<frac in (0,1)>` copies each simple-MoE layer's hottest `frac` of
+  experts into a separate hot tensor on the layer's device.
+- `LLAMA_MOE_PROFILE=<expert-usage.csv>` reorders each layer's experts by descending
+  usage first, so the hot prefix holds the actual hottest experts (without it the split
+  is by file order and gives no coverage win). Reordering is a pure relabeling - router
+  columns and expert weights are permuted together - so model output is unchanged.
+- `--no-mmap` is required with a profile: reordering rewrites the weights in place, which
+  mmap'd (read-only) tensors do not allow. Without it the split falls back to file order.

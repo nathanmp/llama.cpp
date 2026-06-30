@@ -19,7 +19,14 @@ set -u
 
 # ---- CONFIG ----------------------------------------------------------------
 BENCH=${BENCH:-./build/bin/llama-bench}
-CLI=${CLI:-./build/bin/llama-cli}     # for the expert-reduction sweep (set to llama-completion if preferred)
+# expert-reduction sweep binary. llama-cli is gated behind LLAMA_BUILD_SERVER, so prefer
+# llama-completion (always built). Override with CLI=... to force one.
+CLI=${CLI:-}
+if [ -z "$CLI" ]; then
+    for c in ./build/bin/llama-completion ./build/bin/llama-cli; do
+        [ -x "$c" ] && { CLI=$c; break; }
+    done
+fi
 MODEL=${MODEL:?set MODEL=/path/to/model.gguf}
 ARCH=${ARCH:-}                        # gguf arch name for --override-kv, e.g. glm4moe / qwen3moe / olmoe (empty -> skip EUC sweep)
 

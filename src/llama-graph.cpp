@@ -1665,8 +1665,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // PROTOTYPE (Phase 2): expert-aware device placement. When load-time placement has created a
     // physically separate "hot" expert tensor (up/gate/down_exps_hot, experts [0,n_split) on a
     // possibly-different buffer, e.g. GPU), run those experts on the hot tensor and the remaining
-    // cold experts on a view of the full tensor (e.g. CPU), recombining with masked routing
-    // weights. Simple separate-gate/up SILU MoE only; everything else uses the single path below.
+    // cold experts on the full tensor (e.g. CPU), recombining with masked routing weights. Simple
+    // separate-gate/up SILU MoE only; everything else uses the single path below.
     const bool moe_split_simple =
         up_exps_hot && gate_exps_hot && down_exps_hot &&
         gate_exps && up_exps && down_exps && !gate_up_exps &&
@@ -1678,40 +1678,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (moe_split_simple) {
         const int64_t n_split = up_exps_hot->ne[2];   // hot experts live in [0, n_split)
-        const int64_t n_cold  = n_expert - n_split;
 
         static bool logged = false;
         if (!logged) {
             logged = true;
             LLAMA_LOG_INFO("%s: MoE expert device-split active (hot %lld / cold %lld experts per layer)\n",
-                    __func__, (long long) n_split, (long long) n_cold);
+                    __func__, (long long) n_split, (long long) (n_expert - n_split));
         }
 
-        // route each (token, slot) to exactly one group by clamping the expert id into range;
-        // out-of-range slots become don't-cares that the masks below zero out.
-        // note: ggml_clamp is in-place (a view of its input), so each clamp gets its own cast
-        // buffer and the unclamped ids_f is kept separate.
-        ggml_tensor * ids_f  = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        // route each (token, slot) to one group by clamping the global expert id into range; the
+        // out-of-range slots collapse onto one expert (mul_mat_id groups by expert) and the masks
+        // below zero them out. Both groups use global ids: the hot tensor holds experts [0,n_split)
+        // and the cold path runs the full tensor, so no local-id remap or sub-tensor view is needed.
+        // ggml_clamp is in-place (a view of its input), so each clamp gets its own cast buffer and
+        // the unclamped sel_f is kept separate.
+        ggml_tensor * sel_f  = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
         ggml_tensor * idsA_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), 0.0f, (float) (n_split - 1));
         ggml_tensor * idsB_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), (float) n_split, (float) (n_expert - 1));
+        ggml_tensor * idsA   = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
+        ggml_tensor * idsB   = ggml_cast(ctx0, idsB_f, GGML_TYPE_I32);
 
-        // hot group indexes the hot tensor directly; cold group indexes the cold view so its ids
-        // are shifted to local 0-based space
-        ggml_tensor * idsA      = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
-        ggml_tensor * shift     = ggml_arange(ctx0, -(float) n_split, -(float) n_split + 0.5f, 1.0f); // {-n_split}
-        ggml_tensor * idsB_loc  = ggml_cast(ctx0, ggml_add(ctx0, idsB_f, shift), GGML_TYPE_I32);
-
-        // maskA = 1 for hot slots (id < n_split), else 0; maskB is the complement
-        ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, ids_f), 0.0f, 1.0f);
-        ggml_tensor * maskB = ggml_clamp(ctx0, ggml_sub(ctx0, ids_f, idsA_f), 0.0f, 1.0f);
+        // maskA = 1 for hot slots (id < n_split), maskB = 1 for cold slots
+        ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, sel_f), 0.0f, 1.0f);
+        ggml_tensor * maskB = ggml_clamp(ctx0, ggml_sub(ctx0, sel_f, idsA_f), 0.0f, 1.0f);
         maskA = ggml_reshape_3d(ctx0, maskA, 1, n_expert_used, n_tokens);
         maskB = ggml_reshape_3d(ctx0, maskB, 1, n_expert_used, n_tokens);
 
-        // cold experts: contiguous [n_split, n_expert) view of the full tensor (stays where it was
-        // placed, e.g. CPU). hot experts: the separate hot tensor (e.g. GPU).
-        auto cold_slice = [&](ggml_tensor * t) {
-            return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], n_cold, t->nb[1], t->nb[2], (size_t) n_split * t->nb[2]);
-        };
         auto expert_ffn = [&](ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * down_t, ggml_tensor * ids) {
             ggml_tensor * u = build_lora_mm_id(up_t,   cur, ids, nullptr);
             ggml_tensor * g = build_lora_mm_id(gate_t, cur, ids, nullptr);
@@ -1719,8 +1711,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return build_lora_mm_id(down_t, a, ids, nullptr); // [n_embd, n_expert_used, n_tokens]
         };
 
+        // hot experts: the separate hot tensor (e.g. GPU). cold experts: the full tensor (e.g. CPU)
+        // indexed by global id - mul_mat_id only touches the cold experts actually selected.
         ggml_tensor * out_hot  = expert_ffn(up_exps_hot, gate_exps_hot, down_exps_hot, idsA);
-        ggml_tensor * out_cold = expert_ffn(cold_slice(up_exps), cold_slice(gate_exps), cold_slice(down_exps), idsB_loc);
+        ggml_tensor * out_cold = expert_ffn(up_exps, gate_exps, down_exps, idsB);
 
         ggml_tensor * experts =
             ggml_add(ctx0,

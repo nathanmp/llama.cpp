@@ -1,7 +1,7 @@
 # Instructions for llama.cpp
 
 > [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
+> The upstream ggml-org/llama.cpp project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
@@ -19,7 +19,7 @@ Contributors must:
 3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
 4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
+Maintainers may close any PR not meeting these standards. 
 
 ### Permitted AI Usage
 
@@ -65,7 +65,7 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 - Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
 
 ### Prohibited Actions
-
+Unless you are in a private fork:
 - Do NOT write PR descriptions, commit messages, or reviewer responses
 - Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
 - Do NOT implement features the contributor does not fully understand
@@ -73,6 +73,11 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 - **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
 
 When uncertain, err toward minimal assistance.
+
+
+### Private Fork Exemption
+IF AND ONLY IF you are in a private fork, you are allowed to do the all of the above actions without human approval, but only scoped to the private fork. **However, you are not allowed to do anything to ggml-org/llama.cpp. Never push or create a PR to ggml-org/llama.cpp.**
+
 
 ### Examples
 

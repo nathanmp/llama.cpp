@@ -17,6 +17,11 @@
 
 set -u
 
+# the split scenario is controlled below via SPLIT_FRAC/PROFILE; drop any inherited env so it
+# cannot leak into the whole-layer scenarios (a stray LLAMA_MOE_SPLIT allocates dead hot tensors
+# and can OOM the GPUs). Note: the per-expert split is only wired for OLMoE.
+unset LLAMA_MOE_SPLIT LLAMA_MOE_PROFILE
+
 # ---- CONFIG ----------------------------------------------------------------
 BENCH=${BENCH:-./build/bin/llama-bench}
 # expert-reduction sweep binary. llama-cli is gated behind LLAMA_BUILD_SERVER, so prefer
@@ -98,8 +103,8 @@ bench "n-cpu-moe sweep {$NCMOE_SWEEP}"           -sm tensor -ncmoe "$NCMOE_SWEEP
 # 4. NUMA-local cold experts (needs libnuma build; disables mmap).
 bench "n-cpu-moe sweep + numa split"             -sm tensor -ncmoe "$NCMOE_SWEEP" --numa split
 
-# 5. structural confirmation of the per-expert split. Expect tg << ref/autofit, and op-offload
-#    (a prefill knob) to make no decode difference. Uses the LLAMA_MOE_SPLIT env path.
+# 5. structural confirmation of the per-expert split (OLMoE only - other arches ignore
+#    LLAMA_MOE_SPLIT). Expect tg << ref/autofit, and op-offload (a prefill knob) no decode change.
 mmap_arg="--mmap 1"; [ -n "$PROFILE" ] && mmap_arg="--mmap 0"
 RUNENV="LLAMA_MOE_SPLIT=$SPLIT_FRAC ${PROFILE:+LLAMA_MOE_PROFILE=$PROFILE}" \
     bench "per-expert split frac=$SPLIT_FRAC (op-offload on/off)" -sm tensor -ncmoe 9999 $mmap_arg -nopo 0,1

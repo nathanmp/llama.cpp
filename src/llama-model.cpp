@@ -1652,7 +1652,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // (router columns and expert weights are permuted together), so model output is unchanged.
     if (const char * s = getenv("LLAMA_MOE_SPLIT")) {
         const float frac = atof(s);
-        if (frac > 0.0f && frac < 1.0f) {
+        // only OLMoE wires the hot tensors into build_moe_ffn; for other arches the copies would
+        // be dead weight on the device buffer (wasted VRAM, OOM for large MoE), so skip them.
+        if (arch != LLM_ARCH_OLMOE) {
+            LLAMA_LOG_WARN("%s: LLAMA_MOE_SPLIT is only wired for OLMoE; ignoring for this arch\n", __func__);
+        } else if (frac > 0.0f && frac < 1.0f) {
             // optional per-layer expert usage profile -> hotness-ordered permutation. Reordering
             // rewrites model tensors in place, which is only valid for owned (writable) buffers;
             // mmap'd weights are read-only, so it requires --no-mmap.

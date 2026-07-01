@@ -1706,8 +1706,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         maskA = ggml_reshape_3d(ctx0, maskA, 1, n_expert_used, n_tokens);
         maskB = ggml_reshape_3d(ctx0, maskB, 1, n_expert_used, n_tokens);
 
-        auto expert_ffn = [&](ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * down_t, ggml_tensor * ids) {
+        // [LLAMA_MOE_INDEP] EXPERIMENTAL, opt-in, GPU-UNVALIDATED. Make the hot(GPU) and cold(CPU)
+        // expert matmuls mutually independent so the GGML_SCHED_CONCURRENT scheduler can overlap them.
+        // As built, the graph is a strict pipeline (see the split dump): routing is fused into the
+        // hot split and the recombine fuses into the cold split (cold then reads out_hot). We fix this
+        // with GGML_TENSOR_FLAG_SPLIT, which forces the scheduler to start a new split at a node
+        // *without changing its backend* - so routing stays on the GPU (the CUDA/ROCm topk-moe fusion
+        // is preserved, unlike the earlier device-pinning attempt that crashed). Two boundaries:
+        //   - at the first hot matmul: routing/ids land in a split that precedes both branches, so
+        //     hot and cold each read the ids from before either matmul (independent).
+        //   - at the first recombine mul: the recombine is a split *after* the cold matmul instead of
+        //     fusing into it. Result: [routing:GPU] -> ([hot:GPU] || [cold:CPU]) -> [recombine].
+        static const bool moe_indep = [] {
+            const char * e = getenv("LLAMA_MOE_INDEP");
+            return e && atoi(e) != 0;
+        }();
+
+        auto expert_ffn = [&](ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * down_t, ggml_tensor * ids, bool split_boundary) {
             ggml_tensor * u = build_lora_mm_id(up_t,   cur, ids, nullptr);
+            if (split_boundary) u->flags |= GGML_TENSOR_FLAG_SPLIT; // start the hot split here
             ggml_tensor * g = build_lora_mm_id(gate_t, cur, ids, nullptr);
             ggml_tensor * a = ggml_swiglu_split(ctx0, g, u);
             return build_lora_mm_id(down_t, a, ids, nullptr); // [n_embd, n_expert_used, n_tokens]
@@ -1715,15 +1732,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // hot experts: the separate hot tensor (e.g. GPU). cold experts: the full tensor (e.g. CPU)
         // indexed by global id - mul_mat_id only touches the cold experts actually selected.
-        ggml_tensor * out_hot  = expert_ffn(up_exps_hot, gate_exps_hot, down_exps_hot, idsA);
-        ggml_tensor * out_cold = expert_ffn(up_exps, gate_exps, down_exps, idsB);
+        ggml_tensor * out_hot  = expert_ffn(up_exps_hot, gate_exps_hot, down_exps_hot, idsA, moe_indep);
+        ggml_tensor * out_cold = expert_ffn(up_exps, gate_exps, down_exps, idsB, false);
         cb(out_hot,  "ffn_moe_split_out_hot",  il);
         cb(out_cold, "ffn_moe_split_out_cold", il);
 
+        ggml_tensor * wA = ggml_mul(ctx0, weights, maskA);
+        ggml_tensor * wB = ggml_mul(ctx0, weights, maskB);
+        if (moe_indep) wA->flags |= GGML_TENSOR_FLAG_SPLIT; // start the recombine split here (off the cold split)
         ggml_tensor * experts =
             ggml_add(ctx0,
-                ggml_mul(ctx0, out_hot,  ggml_mul(ctx0, weights, maskA)),
-                ggml_mul(ctx0, out_cold, ggml_mul(ctx0, weights, maskB)));
+                ggml_mul(ctx0, out_hot,  wA),
+                ggml_mul(ctx0, out_cold, wB));
         cb(experts, "ffn_moe_split_weighted", il);
 
         ggml_build_forward_expand(gf, experts);

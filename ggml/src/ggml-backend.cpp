@@ -1280,6 +1280,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            // [GGML_TENSOR_FLAG_SPLIT] the graph author forced a split boundary at this node, to expose
+            // independent sub-branches to the concurrent scheduler without moving any tensor between
+            // backends (a backend change already starts a new split below; this handles the same-backend
+            // case). skip when the node already starts the current split, to avoid an empty split.
+            if ((node->flags & GGML_TENSOR_FLAG_SPLIT) && i != split->i_start) {
+                need_new_split = true;
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];

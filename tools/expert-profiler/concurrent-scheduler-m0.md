@@ -115,51 +115,52 @@ gives it nothing independent.
 onto its source's backend. So pinning `selected_experts` does nothing — you must pin
 `selected_experts->view_src` (the underlying `argsort`).
 
-## Experimental independence restructure: `LLAMA_MOE_INDEP=1`
+### dead end: device pinning (removed)
 
-**Status: opt-in, GPU-UNVALIDATED.** `build_moe_ffn` applies two placement-only pins (no math change)
-to break both fusions:
+The first fix tried to move routing to the CPU by pinning `selected_experts` and friends. It failed
+twice: (1) `selected_experts` is a `ggml_argsort_top_k` *view*, and the scheduler forces a view onto
+its source's backend, so the pin was a no-op that left a half-pinned graph and hung a GPU; (2) pinning
+routing to the CPU **breaks the CUDA/ROCm topk-moe fusion** (`ggml_cuda_topk_moe_fusion`), which fuses
+argsort+softmax+get_rows into one GPU kernel — splitting that across CPU/GPU makes the fused kernel
+read wrong-device pointers -> `ROCm error: an illegal memory access was encountered`. Device pinning
+cannot expose the independence without fighting the routing fusion, so it was removed.
 
-1. routing -> CPU: pin the argsort (`selected_experts->view_src`) and the id/mask/weight tensors, so
-   routing becomes a split that precedes both branches.
-2. recombine -> GPU: pin the final `add` (`experts`) to backend 0 (a GPU), so it is a split *after*
-   the cold matmuls instead of fusing into the cold split.
+## The fix: a split-boundary hint (`GGML_TENSOR_FLAG_SPLIT`)
 
-**This approach was tried and REMOVED — it is a dead end.** Two independent problems killed it:
+Instead of moving tensors between devices, a new tensor flag tells the scheduler to **start a new
+split at a node without changing its backend** (honored in `ggml_backend_sched_split_graph`'s split
+loop). Routing stays on the GPU (topk-moe fusion intact); the graph is just *cut* at two points.
 
-- The first attempt hung a GPU because `selected_experts` is a `ggml_argsort_top_k` *view* and the
-  scheduler forces views onto their source's backend, so the pin was a no-op that left a half-pinned
-  graph.
-- Pinning routing to the CPU **breaks the CUDA/ROCm topk-moe fusion** (`ggml_cuda_topk_moe_fusion`,
-  `ggml/src/ggml-cuda/ggml-cuda.cu`), which fuses argsort+softmax+get_rows into one GPU kernel.
-  Splitting that pattern across CPU/GPU leaves the fused kernel reading wrong-device pointers ->
-  `ROCm error: an illegal memory access was encountered`.
+`build_moe_ffn`, under `LLAMA_MOE_INDEP=1`, marks two boundaries:
 
-So device pinning cannot expose the independence without fighting the routing fusion. `LLAMA_MOE_INDEP`
-has been removed; `GGML_SCHED_CONCURRENT` is scheduler-only and safe.
+1. the first hot matmul — so routing/ids land in a split that precedes both branches;
+2. the first recombine mul — so the recombine is a split *after* the cold matmul instead of fusing
+   into it.
 
-## The correct next step: a split-boundary hint (no device change)
+Target structure: `[routing:GPU] -> ( [hot:GPU] || [cold:CPU] ) -> [recombine]`, with hot and cold
+each reading the ids from the *preceding* split, so they are mutually independent.
 
-The right mechanism keeps every tensor on its natural backend (routing stays on the GPU, fusion
-intact) and only tells the scheduler to **start a new split** at two points: after the routing/id/mask
-prep, and after the cold matmul. That yields:
+**Status: CPU-validated, GPU-UNVALIDATED.** `tests/test-sched-split.cpp` proves the flag forces an
+extra split with a bit-identical result (it changes only where the graph is cut, not what runs where —
+correctness-preserving by construction, and it *cannot* cause the illegal-access the pinning did).
+What still needs the rig: that the two marks produce the intended structure on the real graph, and
+that the concurrent *execution* of the resulting independent splits does not hit a HIP issue.
 
+```sh
+# 1. does the restructure expose independence? (dump prints before compute; Ctrl-C after it)
+LLAMA_MOE_INDEP=1 GGML_SCHED_DEBUG=1 LLAMA_MOE_SPLIT=0.5 \
+  ./build/bin/llama-cli -m ~/models/OLMoE.gguf -ngl 99 --device ROCm0 -ncmoe 999 -n 1 -p hi
+#    check: out_cold no longer lists an out_hot input; routing/topk still on ROCm0 (fusion kept).
+
+# 2. only then turn on overlap (single GPU; graphs off until M1):
+GGML_CUDA_DISABLE_GRAPHS=1 LLAMA_MOE_INDEP=1 GGML_SCHED_CONCURRENT=1 GGML_SCHED_DEBUG=1 LLAMA_MOE_SPLIT=0.5 \
+  ./build/bin/llama-cli -m ~/models/OLMoE.gguf -ngl 99 --device ROCm0 -ncmoe 999 -n 16 -p hi
+#    check: G >= 1. if (1) was clean but this hangs, it is concurrent *execution* on HIP -> report it.
 ```
-[routing+ids : GPU]  ->  ( [hot : GPU]  ||  [cold : CPU] )  ->  [recombine]
-```
 
-with hot and cold each consuming the routing outputs produced in the *preceding* split, so they are
-mutually independent and the concurrent scheduler overlaps them — without moving anything between
-devices and without touching the topk-moe fusion. The boundary must sit *after* the fusable
-argsort/softmax/get_rows region so the fusion is preserved.
-
-Implementing this cleanly needs a small scheduler addition (a per-node "force new split" mark checked
-in `ggml_backend_sched_split_graph`'s split loop) plus two marks in `build_moe_ffn`. It changes only
-where the graph is cut, not what runs where, so it is correctness-preserving by construction and
-cannot cause the illegal-access seen above — but it is core scheduler code and needs rig validation.
-
-Use a **single GPU** (`--device ROCm0`) for the M0 proof: the multi-GPU dump showed layers spread
-across ROCm0..3 (layer-parallel), which adds cross-GPU dependencies that are M3's problem, not M0's.
+Use a **single GPU** (`--device ROCm0`) and `-ncmoe 999` (experts' full tensors on CPU) for the M0
+proof: the multi-GPU dump showed layers spread across ROCm0..3 (layer-parallel), which adds cross-GPU
+dependencies that are M3's problem, not M0's.
 
 ## Not yet handled (M1)
 

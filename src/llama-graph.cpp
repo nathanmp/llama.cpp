@@ -1474,7 +1474,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * up_exps_hot,
+         ggml_tensor * gate_exps_hot,
+         ggml_tensor * down_exps_hot) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1494,7 +1497,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        up_exps_hot,
+        gate_exps_hot,
+        down_exps_hot
     );
 }
 
@@ -1521,7 +1527,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * up_exps_hot,
+         ggml_tensor * gate_exps_hot,
+         ggml_tensor * down_exps_hot) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1652,6 +1661,92 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // PROTOTYPE (Phase 2): expert-aware device placement. When load-time placement has created a
+    // physically separate "hot" expert tensor (up/gate/down_exps_hot, experts [0,n_split) on a
+    // possibly-different buffer, e.g. GPU), run those experts on the hot tensor and the remaining
+    // cold experts on a view of the full tensor (e.g. CPU), recombining with masked routing
+    // weights. Simple separate-gate/up SILU MoE only; everything else uses the single path below.
+    const bool moe_split_simple =
+        up_exps_hot && gate_exps_hot && down_exps_hot &&
+        gate_exps && up_exps && down_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !exp_probs_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && !weight_before_ffn &&
+        hparams.n_expert_groups <= 1 && n_expert == (int64_t) hparams.n_expert &&
+        arch != LLM_ARCH_GROVEMOE && arch != LLM_ARCH_STEP35;
+
+    if (moe_split_simple) {
+        const int64_t n_split = up_exps_hot->ne[2];   // hot experts live in [0, n_split)
+        const int64_t n_cold  = n_expert - n_split;
+
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: MoE expert device-split active (hot %lld / cold %lld experts per layer)\n",
+                    __func__, (long long) n_split, (long long) n_cold);
+        }
+
+        // route each (token, slot) to exactly one group by clamping the expert id into range;
+        // out-of-range slots become don't-cares that the masks below zero out.
+        // note: ggml_clamp is in-place (a view of its input), so each clamp gets its own cast
+        // buffer and the unclamped ids_f is kept separate.
+        ggml_tensor * ids_f  = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        ggml_tensor * idsA_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), 0.0f, (float) (n_split - 1));
+        ggml_tensor * idsB_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), (float) n_split, (float) (n_expert - 1));
+
+        // hot group indexes the hot tensor directly; cold group indexes the cold view so its ids
+        // are shifted to local 0-based space
+        ggml_tensor * idsA      = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
+        ggml_tensor * shift     = ggml_arange(ctx0, -(float) n_split, -(float) n_split + 0.5f, 1.0f); // {-n_split}
+        ggml_tensor * idsB_loc  = ggml_cast(ctx0, ggml_add(ctx0, idsB_f, shift), GGML_TYPE_I32);
+
+        // maskA = 1 for hot slots (id < n_split), else 0; maskB is the complement
+        ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, ids_f), 0.0f, 1.0f);
+        ggml_tensor * maskB = ggml_clamp(ctx0, ggml_sub(ctx0, ids_f, idsA_f), 0.0f, 1.0f);
+        maskA = ggml_reshape_3d(ctx0, maskA, 1, n_expert_used, n_tokens);
+        maskB = ggml_reshape_3d(ctx0, maskB, 1, n_expert_used, n_tokens);
+
+        // cold experts: contiguous [n_split, n_expert) view of the full tensor (stays where it was
+        // placed, e.g. CPU). hot experts: the separate hot tensor (e.g. GPU).
+        auto cold_slice = [&](ggml_tensor * t) {
+            return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], n_cold, t->nb[1], t->nb[2], (size_t) n_split * t->nb[2]);
+        };
+        auto expert_ffn = [&](ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * down_t, ggml_tensor * ids) {
+            ggml_tensor * u = build_lora_mm_id(up_t,   cur, ids, nullptr);
+            ggml_tensor * g = build_lora_mm_id(gate_t, cur, ids, nullptr);
+            ggml_tensor * a = ggml_swiglu_split(ctx0, g, u);
+            return build_lora_mm_id(down_t, a, ids, nullptr); // [n_embd, n_expert_used, n_tokens]
+        };
+
+        ggml_tensor * out_hot  = expert_ffn(up_exps_hot, gate_exps_hot, down_exps_hot, idsA);
+        ggml_tensor * out_cold = expert_ffn(cold_slice(up_exps), cold_slice(gate_exps), cold_slice(down_exps), idsB_loc);
+
+        ggml_tensor * experts =
+            ggml_add(ctx0,
+                ggml_mul(ctx0, out_hot,  ggml_mul(ctx0, weights, maskA)),
+                ggml_mul(ctx0, out_cold, ggml_mul(ctx0, weights, maskB)));
+        cb(experts, "ffn_moe_split_weighted", il);
+
+        ggml_build_forward_expand(gf, experts);
+
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
+
+        ggml_tensor * moe_out = cur_experts[0];
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+            ggml_build_forward_expand(gf, moe_out);
+        }
+        if (hparams.n_expert_used == 1) {
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]

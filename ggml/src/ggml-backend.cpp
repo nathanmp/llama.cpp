@@ -1752,10 +1752,10 @@ static int ggml_backend_sched_concurrent_group_end(
     return end;
 }
 
-// [GGML_SCHED_CONCURRENT] one-time dump of the split structure to stderr (enabled by
-// GGML_SCHED_CONCURRENT=1 + GGML_SCHED_DEBUG>=1). shows each split's backend and where its inputs
-// come from, so the reason a hot/cold pair does or does not overlap is visible on the rig (ggml's
-// own GGML_LOG_DEBUG split dump is routed through the host app and usually suppressed).
+// one-time dump of the split structure to stderr (enabled by GGML_SCHED_DEBUG>=1). shows each
+// split's backend and where its inputs come from, so the reason a hot/cold pair does or does not
+// overlap is visible on the rig (ggml's own GGML_LOG_DEBUG split dump is routed through the host
+// app and usually suppressed). printed via fprintf for the same reason.
 static void ggml_backend_sched_dump_concurrency(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1796,7 +1796,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    if (sched->concurrent && sched->debug) {
+    if (sched->debug) {
         static std::atomic<bool> dumped{ false };
         bool expected = false;
         if (dumped.compare_exchange_strong(expected, true)) {

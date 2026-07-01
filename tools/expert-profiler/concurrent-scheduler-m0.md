@@ -82,42 +82,74 @@ ggml_backend_sched_compute_splits: [GGML_SCHED_CONCURRENT] N of M splits ran in 
   independent** as the scheduler sees them, so nothing overlaps and the perf test is inconclusive.
 
 Add `GGML_SCHED_DEBUG=1` to get a one-time dump of the full split structure (printed to stderr via
-`fprintf`, so it survives llama's log routing which suppresses ggml's own `GGML_LOG_DEBUG`):
+`fprintf`, so it survives llama's log routing which suppresses ggml's own `GGML_LOG_DEBUG`). It lists
+each split's backend and where each input comes from, and prints **before** compute, so it is safe to
+`Ctrl-C` right after it to inspect the structure without running a full benchmark.
+
+## Why G is 0: the graph is a strict pipeline (from the rig dump)
+
+The first rig dump (OLMoE, `-ncmoe 999`, 4 GPUs) showed every split marked `[depends on prev split]`
+— a strict pipeline, one layer after another:
 
 ```
-=== [GGML_SCHED_CONCURRENT] split structure: 34 splits ===
-  split   4  backend=ROCm0  nodes=12  inputs=1  out=ffn_moe_split_out_hot
-         in[0] <- ffn_moe_split_idsB       (from CPU)      <- cold ids come from a CPU split (good)
-  split   5  backend=CPU    nodes=4   inputs=2  out=ffn_moe_split_out_cold
-         in[0] <- ffn_norm-4               (from ROCm0)
-         in[1] <- ffn_moe_split_idsB       (from CPU)
-...
+split1 [ROCm: attn + routing + HOT]_L  ->  split2 [CPU: COLD + recombine]_L  ->  split3 [ROCm: ...]_L+1
 ```
 
-This shows, per split, its backend and where each input comes from. If the cold split (`out_cold`,
-CPU) has an input `[depends on prev split]` pointing at the hot split (`out_hot`, GPU), that
-dependency is what blocks overlap.
+Two fusions block overlap:
 
-## hot/cold split independence (why G was 0, and the fix)
+1. **Routing is fused into the hot(GPU) split.** The router `ffn_moe_topk` (a.k.a. `selected_experts`)
+   is computed on the GPU alongside the hot matmul, so the cold split reads the routing ids from
+   *inside* the hot split.
+2. **The recombine is fused into the cold(CPU) split.** `split 2` (cold) has an input
+   `ffn_moe_split_out_hot-0 (from ROCm0)` — the cold split literally consumes the hot output, because
+   the final `add` of `experts = out_hot*maskA + out_cold*maskB` landed on the CPU next to the cold
+   matmul. So cold cannot start until hot finishes.
 
-For the two expert matmuls to overlap, the CPU-cold split must not depend on anything the GPU-hot
-split computes. By default the router (`selected_experts`) and the cold-side id cast (`idsB`) are
-cheap ops derived from the GPU-resident router; the scheduler's "expand gpu down" pass sweeps them
-onto the GPU and **fuses them into the hot split**. The cold split then consumes `idsB` from inside
-the hot split, so `ggml_backend_sched_concurrent_group_end` correctly refuses to overlap them (it
-would be a data race) and you get `G == 0`. This is exactly what the first rig run showed.
+Because of these, `ggml_backend_sched_concurrent_group_end` correctly refuses to overlap anything
+(it would be a data race) and reports `G == 0`. The scheduler concurrency itself is fine — the graph
+gives it nothing independent.
 
-**Fix (implemented):** when `GGML_SCHED_CONCURRENT` is set, `build_moe_ffn`
-(`src/llama-graph.cpp`) pins `selected_experts`, `idsB_f` and `idsB` to the CPU backend. That makes
-the routing a split that **precedes both branches**, so hot and cold each consume routing outputs
-produced *before* either matmul and become mutually independent. It is placement only (no change to
-the math) and only active with the concurrency flag, so the default split path is untouched. Verify
-with the `GGML_SCHED_DEBUG=1` dump that `out_hot` (GPU) and `out_cold` (CPU) no longer depend on each
-other and that `G` jumps to roughly one group per MoE layer.
+### gotcha: `selected_experts` is a view
 
-If `G` is still 0 with the pin on, paste the split-structure dump — the remaining dependency will be
-visible in it (some other cold-branch input still resolves to the hot split) and the pin set can be
-extended to cover it.
+`ggml_argsort_top_k` returns a `ggml_view_4d` of the argsort result, and the scheduler forces a view
+onto its source's backend. So pinning `selected_experts` does nothing — you must pin
+`selected_experts->view_src` (the underlying `argsort`).
+
+## Experimental independence restructure: `LLAMA_MOE_INDEP=1`
+
+**Status: opt-in, GPU-UNVALIDATED.** `build_moe_ffn` applies two placement-only pins (no math change)
+to break both fusions:
+
+1. routing -> CPU: pin the argsort (`selected_experts->view_src`) and the id/mask/weight tensors, so
+   routing becomes a split that precedes both branches.
+2. recombine -> GPU: pin the final `add` (`experts`) to backend 0 (a GPU), so it is a split *after*
+   the cold matmuls instead of fusing into the cold split.
+
+Target structure: `[routing:CPU] -> ( [hot:GPU] || [cold:CPU] ) -> [recombine:GPU]`, with hot and
+cold mutually independent.
+
+This is deliberately decoupled from `GGML_SCHED_CONCURRENT` so the two can be tested in isolation:
+
+```sh
+# 1. does the restructure make hot/cold independent? (inspect the dump, then Ctrl-C)
+LLAMA_MOE_INDEP=1 GGML_SCHED_DEBUG=1 LLAMA_MOE_SPLIT=0.5 \
+  ./build/bin/llama-cli -m ~/models/OLMoE.gguf -ngl 99 --device ROCm0 -n 1 -p hi
+#    check: routing/topk now on CPU, out_cold no longer lists an out_hot input.
+#    if it also completes without hanging, the restructured *graph* is fine.
+
+# 2. only then, turn on overlap:
+LLAMA_MOE_INDEP=1 GGML_SCHED_CONCURRENT=1 GGML_SCHED_DEBUG=1 LLAMA_MOE_SPLIT=0.5 \
+  ./build/bin/llama-cli -m ~/models/OLMoE.gguf -ngl 99 --device ROCm0 -n 16 -p hi
+#    check: G >= 1. if this hangs but (1) did not, the issue is concurrent *execution* on HIP,
+#    not the graph — report that and we fix the scheduler side.
+```
+
+Use a **single GPU** (`--device ROCm0`) for the M0 proof: the multi-GPU dump showed layers spread
+across ROCm0..3 (layer-parallel), which adds cross-GPU dependencies that are M3's problem, not M0's.
+
+> Note: the earlier build's `GGML_SCHED_CONCURRENT`-coupled pin was removed — it pinned the
+> `selected_experts` *view* (a no-op) leaving a half-pinned graph, which is the likely cause of the
+> GPU hang seen on the first attempt. `GGML_SCHED_CONCURRENT` alone no longer touches the graph.
 
 ## Not yet handled (M1)
 

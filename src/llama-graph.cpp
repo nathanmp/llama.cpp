@@ -1700,24 +1700,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(idsA, "ffn_moe_split_idsA", il);
         cb(idsB, "ffn_moe_split_idsB", il);
 
-        // [GGML_SCHED_CONCURRENT] for the hot(GPU) and cold(CPU) expert matmuls to actually overlap,
-        // the cold split must not depend on the hot split. by default the router (selected_experts)
-        // and the cold-side id cast are cheap ops the scheduler sweeps onto the GPU and fuses into the
-        // hot split, so the cold split reads them from inside hot and cannot run concurrently (the
-        // concurrent scheduler then finds 0 independent groups). pinning the router and the cold ids
-        // to the CPU makes routing a split that precedes both branches, so hot and cold become
-        // mutually independent. this is placement only (no change to the math) and is applied only
-        // when concurrent execution is requested, so the default split path is untouched.
-        static const bool pin_routing = [] {
-            const char * e = getenv("GGML_SCHED_CONCURRENT");
-            return e && atoi(e) != 0;
-        }();
-        if (pin_routing && sched && backend_cpu) {
-            ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
-            ggml_backend_sched_set_tensor_backend(sched, idsB_f,           backend_cpu);
-            ggml_backend_sched_set_tensor_backend(sched, idsB,             backend_cpu);
-        }
-
         // maskA = 1 for hot slots (id < n_split), maskB = 1 for cold slots
         ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, sel_f), 0.0f, 1.0f);
         ggml_tensor * maskB = ggml_clamp(ctx0, ggml_sub(ctx0, sel_f, idsA_f), 0.0f, 1.0f);
@@ -1743,6 +1725,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_mul(ctx0, out_hot,  ggml_mul(ctx0, weights, maskA)),
                 ggml_mul(ctx0, out_cold, ggml_mul(ctx0, weights, maskB)));
         cb(experts, "ffn_moe_split_weighted", il);
+
+        // [LLAMA_MOE_INDEP] EXPERIMENTAL, opt-in, GPU-untested. Restructure the split so the hot(GPU)
+        // and cold(CPU) expert matmuls are mutually independent and can be overlapped by the
+        // GGML_SCHED_CONCURRENT scheduler. As built, the graph is a strict pipeline: the router is
+        // fused into the hot(GPU) split and the recombine add is fused into the cold(CPU) split (which
+        // then reads out_hot), so cold depends on hot and nothing overlaps (see the split dump).
+        // Two placement-only pins fix that:
+        //   1. routing -> CPU: pin the argsort (selected_experts is a *view*, so pin its view_src) and
+        //      the id/mask/weight tensors, so routing becomes a split that precedes both branches.
+        //   2. recombine -> GPU: pin the final add so it is a split *after* the cold matmuls, instead
+        //      of fusing into the cold split and dragging out_hot into it.
+        // Result: [routing:CPU] -> ([hot:GPU] || [cold:CPU]) -> [recombine:GPU]. No math change.
+        static const bool moe_indep = [] {
+            const char * e = getenv("LLAMA_MOE_INDEP");
+            return e && atoi(e) != 0;
+        }();
+        if (moe_indep && sched && backend_cpu) {
+            ggml_backend_t backend_gpu = ggml_backend_sched_get_n_backends(sched) > 0
+                ? ggml_backend_sched_get_backend(sched, 0) : nullptr; // backend 0 = highest-prio (a GPU)
+            // routing -> CPU (argsort is behind a view; pin the underlying op)
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts->view_src ? selected_experts->view_src : selected_experts, backend_cpu);
+            for (ggml_tensor * t : { sel_f, idsA_f, idsB_f, idsA, idsB, maskA, maskB, weights }) {
+                ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            }
+            // recombine -> GPU, so it does not fuse into the cold split
+            if (backend_gpu && backend_gpu != backend_cpu) {
+                ggml_backend_sched_set_tensor_backend(sched, experts, backend_gpu);
+            }
+        }
 
         ggml_build_forward_expand(gf, experts);
 

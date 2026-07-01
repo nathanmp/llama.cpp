@@ -1697,6 +1697,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * idsB_f = ggml_clamp(ctx0, ggml_cast(ctx0, selected_experts, GGML_TYPE_F32), (float) n_split, (float) (n_expert - 1));
         ggml_tensor * idsA   = ggml_cast(ctx0, idsA_f, GGML_TYPE_I32);
         ggml_tensor * idsB   = ggml_cast(ctx0, idsB_f, GGML_TYPE_I32);
+        cb(idsA, "ffn_moe_split_idsA", il);
+        cb(idsB, "ffn_moe_split_idsB", il);
+
+        // [GGML_SCHED_CONCURRENT] for the hot(GPU) and cold(CPU) expert matmuls to actually overlap,
+        // the cold split must not depend on the hot split. by default the router (selected_experts)
+        // and the cold-side id cast are cheap ops the scheduler sweeps onto the GPU and fuses into the
+        // hot split, so the cold split reads them from inside hot and cannot run concurrently (the
+        // concurrent scheduler then finds 0 independent groups). pinning the router and the cold ids
+        // to the CPU makes routing a split that precedes both branches, so hot and cold become
+        // mutually independent. this is placement only (no change to the math) and is applied only
+        // when concurrent execution is requested, so the default split path is untouched.
+        static const bool pin_routing = [] {
+            const char * e = getenv("GGML_SCHED_CONCURRENT");
+            return e && atoi(e) != 0;
+        }();
+        if (pin_routing && sched && backend_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, idsB_f,           backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, idsB,             backend_cpu);
+        }
 
         // maskA = 1 for hot slots (id < n_split), maskB = 1 for cold slots
         ggml_tensor * maskA = ggml_clamp(ctx0, ggml_sub(ctx0, idsB_f, sel_f), 0.0f, 1.0f);
@@ -1715,6 +1735,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // indexed by global id - mul_mat_id only touches the cold experts actually selected.
         ggml_tensor * out_hot  = expert_ffn(up_exps_hot, gate_exps_hot, down_exps_hot, idsA);
         ggml_tensor * out_cold = expert_ffn(up_exps, gate_exps, down_exps, idsB);
+        cb(out_hot,  "ffn_moe_split_out_hot",  il);
+        cb(out_cold, "ffn_moe_split_out_cold", il);
 
         ggml_tensor * experts =
             ggml_add(ctx0,

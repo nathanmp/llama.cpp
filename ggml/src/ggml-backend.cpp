@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1751,9 +1752,57 @@ static int ggml_backend_sched_concurrent_group_end(
     return end;
 }
 
+// [GGML_SCHED_CONCURRENT] one-time dump of the split structure to stderr (enabled by
+// GGML_SCHED_CONCURRENT=1 + GGML_SCHED_DEBUG>=1). shows each split's backend and where its inputs
+// come from, so the reason a hot/cold pair does or does not overlap is visible on the rig (ggml's
+// own GGML_LOG_DEBUG split dump is routed through the host app and usually suppressed).
+static void ggml_backend_sched_dump_concurrency(ggml_backend_sched_t sched) {
+    struct ggml_backend_sched_split * splits = sched->splits;
+
+    // map each produced node to the split that produces it
+    std::unordered_map<const ggml_tensor *, int> producer;
+    for (int s = 0; s < sched->n_splits; s++) {
+        for (int n = 0; n < splits[s].graph.n_nodes; n++) {
+            producer[splits[s].graph.nodes[n]] = s;
+        }
+    }
+
+    fprintf(stderr, "\n=== [GGML_SCHED_CONCURRENT] split structure: %d splits ===\n", sched->n_splits);
+    for (int s = 0; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * sp = &splits[s];
+        const char * bname = ggml_backend_name(sched->backends[sp->backend_id]);
+        const char * last  = sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes - 1]->name : "?";
+        // does this split depend on the immediately preceding one? (the common overlap blocker)
+        int dep_prev = -1;
+        for (int i = 0; i < sp->n_inputs; i++) {
+            auto it = producer.find(sp->inputs[i]);
+            if (it != producer.end() && it->second == s - 1) { dep_prev = i; break; }
+        }
+        fprintf(stderr, "  split %3d  backend=%-10s  nodes=%3d  inputs=%d  out=%-24s%s\n",
+            s, bname, sp->graph.n_nodes, sp->n_inputs, last,
+            dep_prev >= 0 ? "  [depends on prev split]" : "");
+        for (int i = 0; i < sp->n_inputs; i++) {
+            auto it = producer.find(sp->inputs[i]);
+            const int ps = it != producer.end() ? it->second : -1;
+            fprintf(stderr, "         in[%d] <- %-24s (from %s)\n",
+                i, sp->inputs[i]->name,
+                ps >= 0 ? ggml_backend_name(sched->backends[splits[ps].backend_id]) : "external");
+        }
+    }
+    fprintf(stderr, "=== end split structure ===\n\n");
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    if (sched->concurrent && sched->debug) {
+        static std::atomic<bool> dumped{ false };
+        bool expected = false;
+        if (dumped.compare_exchange_strong(expected, true)) {
+            ggml_backend_sched_dump_concurrency(sched);
+        }
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;

@@ -42,13 +42,18 @@ unchanged.
 ## Running the GO/NO-GO test (on the rig — needs a GPU)
 
 Correctness first, then perf. Uses OLMoE, which already wires the hot/cold split
-(`src/models/olmoe.cpp` + `LLAMA_MOE_SPLIT`).
+(`src/models/olmoe.cpp` + `LLAMA_MOE_SPLIT`). `llama-bench` has no `--cpu-moe`; use `-ncmoe 999`
+(all expert layers' full tensors on CPU), which is the equivalent placement — `LLAMA_MOE_SPLIT`
+then puts the hot prefix on the GPU.
 
 ```sh
 # baseline (sequential) vs concurrent, same placement
-LLAMA_MOE_SPLIT=0.5 ./build/bin/llama-bench -m ~/models/OLMoE.gguf --cpu-moe 1 -mmp 0 -n 64 -p 0
-GGML_SCHED_CONCURRENT=1 LLAMA_MOE_SPLIT=0.5 ./build/bin/llama-bench -m ~/models/OLMoE.gguf --cpu-moe 1 -mmp 0 -n 64 -p 0
+LLAMA_MOE_SPLIT=0.5 ./build/bin/llama-bench -m ~/models/OLMoE.gguf -ncmoe 999 -mmp 0 -n 64 -p 0
+GGML_SCHED_CONCURRENT=1 LLAMA_MOE_SPLIT=0.5 ./build/bin/llama-bench -m ~/models/OLMoE.gguf -ncmoe 999 -mmp 0 -n 64 -p 0
 ```
+
+Note the large variance seen on the first `-ncmoe 999` runs (e.g. 20.5 ± 7.07 t/s) — average over
+several `-r` repetitions so the GO/NO-GO delta is not swamped by noise.
 
 - **GO**: concurrent tg is meaningfully higher than sequential (per-layer sync is cheap and the
   overlap wins). Proceed to M1 (robustify) / M2 (wire GLM-4.7).
@@ -75,25 +80,44 @@ ggml_backend_sched_compute_splits: [GGML_SCHED_CONCURRENT] N of M splits ran in 
   numbers above measure the sync cost as intended.
 - `G == 0` (`no independent distinct-backend splits found`) => the hot and cold splits are **not
   independent** as the scheduler sees them, so nothing overlaps and the perf test is inconclusive.
-  See below.
 
-## Known caveat: hot/cold split independence
+Add `GGML_SCHED_DEBUG=1` to get a one-time dump of the full split structure (printed to stderr via
+`fprintf`, so it survives llama's log routing which suppresses ggml's own `GGML_LOG_DEBUG`):
+
+```
+=== [GGML_SCHED_CONCURRENT] split structure: 34 splits ===
+  split   4  backend=ROCm0  nodes=12  inputs=1  out=ffn_moe_split_out_hot
+         in[0] <- ffn_moe_split_idsB       (from CPU)      <- cold ids come from a CPU split (good)
+  split   5  backend=CPU    nodes=4   inputs=2  out=ffn_moe_split_out_cold
+         in[0] <- ffn_norm-4               (from ROCm0)
+         in[1] <- ffn_moe_split_idsB       (from CPU)
+...
+```
+
+This shows, per split, its backend and where each input comes from. If the cold split (`out_cold`,
+CPU) has an input `[depends on prev split]` pointing at the hot split (`out_hot`, GPU), that
+dependency is what blocks overlap.
+
+## hot/cold split independence (why G was 0, and the fix)
 
 For the two expert matmuls to overlap, the CPU-cold split must not depend on anything the GPU-hot
-split computes. In `build_moe_ffn` the routing (`selected_experts`) and the cold-side id cast
-(`idsB`) are cheap ops derived from the GPU-resident router; the scheduler's "expand gpu down" pass
-tends to assign them to the GPU and fuse them into the hot split. The cold split then consumes
-`idsB` from inside the hot split, so `ggml_backend_sched_concurrent_group_end` correctly refuses to
-overlap them (it would be a data race) and you get `G == 0`.
+split computes. By default the router (`selected_experts`) and the cold-side id cast (`idsB`) are
+cheap ops derived from the GPU-resident router; the scheduler's "expand gpu down" pass sweeps them
+onto the GPU and **fuses them into the hot split**. The cold split then consumes `idsB` from inside
+the hot split, so `ggml_backend_sched_concurrent_group_end` correctly refuses to overlap them (it
+would be a data race) and you get `G == 0`. This is exactly what the first rig run showed.
 
-If the rig shows `G == 0`, the fix is graph-side, not scheduler-side: force the routing / cold-id
-ops into a split that precedes the hot split (e.g. pin them so hot and cold both consume routing
-outputs produced *before* either matmul). That wiring is best done against a real
-`GGML_SCHED_DEBUG=2` split dump from the rig, which lists each split's backend and inputs:
+**Fix (implemented):** when `GGML_SCHED_CONCURRENT` is set, `build_moe_ffn`
+(`src/llama-graph.cpp`) pins `selected_experts`, `idsB_f` and `idsB` to the CPU backend. That makes
+the routing a split that **precedes both branches**, so hot and cold each consume routing outputs
+produced *before* either matmul and become mutually independent. It is placement only (no change to
+the math) and only active with the concurrency flag, so the default split path is untouched. Verify
+with the `GGML_SCHED_DEBUG=1` dump that `out_hot` (GPU) and `out_cold` (CPU) no longer depend on each
+other and that `G` jumps to roughly one group per MoE layer.
 
-```sh
-GGML_SCHED_DEBUG=2 LLAMA_MOE_SPLIT=0.5 ./build/bin/llama-cli -m ~/models/OLMoE.gguf --cpu-moe 1 -n 1 -p hi 2>&1 | grep -A2 'SPLIT #'
-```
+If `G` is still 0 with the pin on, paste the split-structure dump — the remaining dependency will be
+visible in it (some other cold-branch input still resolves to the hot split) and the pin set can be
+extended to cover it.
 
 ## Not yet handled (M1)
 

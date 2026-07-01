@@ -46,6 +46,15 @@ outputs (the recombine). Keep a sequential fallback.
 - Correctness: `llama-perplexity` bit-exact vs baseline; poison the hot tensor -> PPL explodes
   (proves the path is live).
 
+**Status: scheduler side implemented** (`GGML_SCHED_CONCURRENT=1`, off by default; see
+`concurrent-scheduler-m0.md`). Independence-based grouping runs mutually-independent,
+distinct-backend splits concurrently (CPU on worker threads, GPU async), with a one-time stderr
+diagnostic reporting how many splits overlapped. Verified on CPU that the sequential path is
+unchanged and the concurrent flag is inert with a single backend. **Needs a rig run** to (a)
+confirm the OLMoE hot/cold splits are seen as independent (`G >= 1` in the diagnostic - if `G == 0`
+the routing/`idsB` ops fused into the hot split and need a graph-side split boundary) and (b)
+measure the GO/NO-GO tg delta. Cloud sessions cannot drive the GPU.
+
 ### M1 - robustify the concurrent scheduler
 Generalize safely: event-based join, interaction with the `n_copies` pipeline path and multiple
 GPU backends, and HIP-graph capture (disable graphs across the concurrent region or capture per

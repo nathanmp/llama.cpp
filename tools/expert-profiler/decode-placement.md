@@ -7,8 +7,8 @@ build next.
 ## The problem with the per-expert split
 
 The graph-level per-expert split (hot experts on GPU, cold on CPU within each layer, recombined
-with masks - enabled by `LLAMA_MOE_SPLIT`) is ~8x slower than all-CPU experts at decode on the
-rig (2.0 vs 16.5 tg). It is not a bug in the placement; it is structural:
+with masks - enabled by `LLAMA_MOE_SPLIT`) is ~4x slower than all-CPU experts at decode on the
+rig (2.0 vs 8.5 tg). It is not a bug in the placement; it is structural:
 
 - ggml runs graph splits **strictly sequentially** with a full backend sync between them
   (`ggml/src/ggml-backend.cpp:1549`), so the GPU-hot and CPU-cold work for a layer cannot

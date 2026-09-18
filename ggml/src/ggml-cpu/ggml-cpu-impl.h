@@ -537,7 +537,7 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
 
-#define GGML_NUMA_MAX_NODES 8
+#define GGML_NUMA_MAX_NODES 32
 
 // Row-split granularity for tensors that are not repacked.
 // A 16-row (64 byte) boundary stops two nodes from sharing a dst cache line.

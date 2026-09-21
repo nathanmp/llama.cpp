@@ -1733,7 +1733,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
-    const bool numa_tensors = ggml_numa_is_tensor_mode() && (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0;
+    const bool numa_tensors = ggml_numa_is_tensor_mode() && (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0 &&
+        params->numa_n_threads > 0;
     const int work_ith = numa_tensors ? params->numa_rank : ith;
     const int work_nth = numa_tensors ? params->numa_n_threads : nth;
     const uint32_t n_nodes = numa_tensors ? ggml_numa_get_node_count() : 1;
@@ -2406,7 +2407,7 @@ static void set_numa_thread_affinity(const struct ggml_compute_state * state) {
         case GGML_NUMA_STRATEGY_TENSORS: {
             // A worker keeps its CPU for the life of the threadpool, but this runs once per graph split.
             // The syscall costs more than the node split saves, so only call it when the CPU changes.
-            if (ggml_numa_pinned_cpu == state->numa_cpu) {
+            if (state->numa_cpu < 0 || ggml_numa_pinned_cpu == state->numa_cpu) {
                 return;
             }
             cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
@@ -2972,9 +2973,9 @@ static void ggml_numa_assign_workers(
     }
 
 #if defined(__gnu_linux__)
+    // a graph of single-task ops gets fewer workers than nodes; it runs without gangs
     if ((uint32_t) tpp->n_threads < g_state.numa.n_nodes) {
-        GGML_ABORT("--numa tensors needs at least one worker per active NUMA node (%d workers, %u nodes)",
-                tpp->n_threads, g_state.numa.n_nodes);
+        return;
     }
 
     const bool has_user_mask = ggml_thread_cpumask_is_valid(tpp->cpumask);
